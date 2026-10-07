@@ -18,7 +18,7 @@ python3 -m app 8081              # 启动，浏览器访问 http://localhost:808
 测试：
 
 ```bash
-python3 -m unittest tests.test_replay -v   # 33 个用例（含离线封存包子进程核对）
+python3 -m unittest tests.test_replay -v   # 39 个用例（含批量复核与离线封存包子进程核对）
 ```
 
 ## 核心不变量（业务红线）
@@ -44,9 +44,14 @@ python3 -m unittest tests.test_replay -v   # 33 个用例（含离线封存包�
    触发器禁止改写/删除其校正参数与校正事件（`test_13/14`）。
 5. **重算失败回滚**：复核"退回重算"与状态变更在**同一事务**中执行，重算中途
    失败整体回滚——复核项回到 `pending`、不产生半个新版本（`test_12`）。
-6. **并发复核只保留一个结果**：复核是 CAS 更新
+6. **并发复核只保留一个结果**：单项复核是 CAS 更新
    `UPDATE … WHERE status='pending' AND review_seq=?`，并发/过期提交只有
    一个成功，其余 `409 review_conflict`；历史只记一条（`test_09/10`）。
+   批量复核同样在**一个 `BEGIN IMMEDIATE` 事务**中校验全部项目的
+   `status='pending' AND review_seq=读取值`；任一项冲突则整批复核项与历史
+   均不变，返回逐项冲突明细。成功批次和冲突批次都会留痕；批次号由规范化
+   请求哈希确定性生成，重复提交原样返回首次结果，响应丢失可用批次号查询恢复
+   （`test_29..33`）。
 7. **审计报告签名**：报告 payload 规范化 JSON 后用**设备密钥** HMAC-SHA256
    签名，签名覆盖 `device_id` 等全部字段——跨设备加载 `403 cross_device_report`，
    任何字段被改 `403 signature_mismatch`（`test_15/16/17`）。
@@ -79,6 +84,31 @@ python3 -m unittest tests.test_replay -v   # 33 个用例（含离线封存包�
 - `ts`：设备时钟读数（秒）；`sync` 事件必须带 `server_ts`（网关/服务器对时戳）
 - `uid` 设备内唯一（幂等键），`seq` 设备侧单调序号
 
+## 批量复核
+
+```json
+{
+  "action": "accept",
+  "reviewer": "张三",
+  "note": "按设备 D1 + 连续超限批量确认",
+  "items": [
+    {"finding_id": "FND-...", "review_seq": 0},
+    {"finding_id": "FND-...", "review_seq": 0}
+  ]
+}
+```
+
+- 先调 `POST /api/review-batches/preview`：只读预览将要接受 / 驳回 / 退回的
+  项目，返回批次号、逐项当前状态与冲突原因；不会修改数据。
+- 再调 `POST /api/review-batches/submit`：服务端在同一写事务中重新校验全部
+  `review_seq`。只要有一项已处理或版本过期，返回
+  `409 review_batch_conflict`，响应体内带 `batch` 和冲突明细，且整批不变。
+- 批次号 `RB-…` 由动作、复核人、备注、项目 ID 与读取 `review_seq` 的规范化
+  JSON 哈希生成。相同请求网络重试返回首次结果；若响应丢失，可直接
+  `GET /api/review-batches/{batch_id}` 恢复。
+- 批量动作必须相同；选择 `return` 时，同一设备的多个项目只触发一次时间线
+  重建，跨设备则每台设备重建一次。单项复核与单项历史接口保持不变。
+
 ## 异常识别规则（`app/detect.py`）
 
 | 类型 | 规则 |
@@ -101,9 +131,12 @@ python3 -m unittest tests.test_replay -v   # 33 个用例（含离线封存包�
 | GET | `/api/batches/{id}` | 批次状态（断点续传依据） |
 | PUT | `/api/batches/{id}/chunks/{n}` | 上传分块 `{events:[…]}`；相同内容幂等，不同内容 `409 chunk_conflict` 保留首块 |
 | POST | `/api/batches/{id}/commit` | 收齐后提交（幂等） |
-| GET | `/api/findings?device_id=&status=` | 复核项列表 |
-| POST | `/api/findings/{id}/review` | 复核 `{action:accept/reject/return, reviewer, note, review_seq}` |
-| GET | `/api/findings/{id}/history` | 处理历史 |
+| GET | `/api/findings?device_id=&status=&ftype=` | 复核项列表（可按设备、状态、异常类型过滤） |
+| POST | `/api/findings/{id}/review` | 单项复核 `{action:accept/reject/return, reviewer, note, review_seq}` |
+| GET | `/api/findings/{id}/history` | 单项处理历史（继续保留） |
+| POST | `/api/review-batches/preview` | 批量预览（不落库）：返回确定性批次号、逐项待处理/冲突明细、退回重算设备 |
+| POST | `/api/review-batches/submit` | 批量提交；同事务 CAS 全量校验，成功/冲突均生成可追踪批次结果 |
+| GET | `/api/review-batches/{batch_id}` | 按批次号查询并恢复首次结果（含冲突明细） |
 | POST | `/api/reports/export` | 导出签名报告 `{device_id, version_id}` |
 | POST | `/api/reports/verify` | 验证并加载 `{device_id, report}` |
 | POST | `/api/seals/issue` | 复核闭环后封存 `{device_id, version_id, issued_by}`；返回**一次性** download_token |
@@ -133,7 +166,9 @@ python3 -m app.sealctl show    封包.json                     # 只看头部（
 - **批次导入**：粘贴/生成事件 → 分块上传（进度条、断点续传、重复包提示）→ 提交
 - **时间线回放**：版本列表（漂移 ppm、状态）→ 曲线图（温度/压力 + 限值线 +
   超限点标红）→ 滑块回放 → 原始/校正对照表
-- **风险复核**：按状态过滤，接受/驳回/退回重算（409 自动刷新），处理历史
+- **风险复核**：按状态和异常类型过滤；勾选/全选当前待复核项，选择同一批量
+  动作并预览批次号、逐项结果与冲突；成功/冲突后可凭批次号查询恢复；单项
+  接受/驳回/退回重算（409 自动刷新）与处理历史继续可用
 - **审计报告**：导出签名报告（可下载 JSON）、粘贴验证加载
 - **封存包**：复核闭环后发放封存包（一次性令牌、立即下载），发放台账，
   离线 `sealctl` 命令用法说明
@@ -150,8 +185,8 @@ app/
   detect.py   连续超限 / 缺失区间 / 计量跳变识别（纯函数）
   guards.py   全部状态迁移（每个迁移一个 BEGIN IMMEDIATE 事务）
   server.py   stdlib HTTP：JSON API + SPA 静态托管
-tests/        33 个端到端不变量用例（含并发复核、失败回滚、HTTP 冒烟、
-                离线封存包子进程核对）
+tests/        39 个端到端不变量用例（含单项/批量并发复核、失败回滚、
+                HTTP 冒烟、离线封存包子进程核对）
 seed.py       演示数据（含一份可离线核对的封存包示例）
 web/          index.html / styles.css / app.js（原生 JS SPA）
 ```

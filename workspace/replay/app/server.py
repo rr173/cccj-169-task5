@@ -148,12 +148,23 @@ class Handler(BaseHTTPRequestHandler):
             if len(p) == 2 and method == "GET":
                 device_id = (query.get("device_id") or [None])[0]
                 status = (query.get("status") or [None])[0]
+                ftype = (query.get("ftype") or [None])[0]
                 return {"findings": guards.list_findings(
-                    conn, device_id=device_id, status=status)}
+                    conn, device_id=device_id, status=status, ftype=ftype)}
             if len(p) == 4 and p[3] == "review" and method == "POST":
                 return guards.review_finding(conn, p[2], body)
             if len(p) == 4 and p[3] == "history" and method == "GET":
                 return guards.finding_history(conn, p[2])
+            raise ApiError(404, "route_not_found", f"未知路径 {path}")
+
+        # /api/review-batches：批量复核预览 / 提交 / 按批次号恢复
+        if len(p) >= 2 and p[1] == "review-batches":
+            if len(p) == 3 and p[2] == "preview" and method == "POST":
+                return guards.preview_review_batch(conn, body)
+            if len(p) == 3 and p[2] == "submit" and method == "POST":
+                return guards.submit_review_batch(conn, body)
+            if len(p) == 3 and method == "GET":
+                return guards.get_review_batch(conn, p[2])
             raise ApiError(404, "route_not_found", f"未知路径 {path}")
 
         # /api/reports...

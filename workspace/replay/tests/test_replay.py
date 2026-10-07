@@ -452,6 +452,192 @@ class ReplayTest(unittest.TestCase):
             "SELECT COUNT(*) AS c FROM timeline_versions").fetchone()["c"]
         self.assertEqual(versions_before, versions_after)
 
+    def test_29_batch_preview_submit_and_duplicate_returns_original_result(self):
+        self.build_with_anomalies()
+        pending = guards.list_findings(
+            self.conn, device_id=self.dev["device_id"], status="pending")
+        chosen = pending[:2]
+        payload = {
+            "action": "accept", "reviewer": "张三", "note": "批量确认",
+            "items": [{"finding_id": f["finding_id"],
+                       "review_seq": f["review_seq"]} for f in chosen],
+        }
+        preview = guards.preview_review_batch(self.conn, payload)
+        self.assertEqual(preview["status"], "preview")
+        self.assertEqual(preview["ready_count"], 2)
+        self.assertEqual(preview["conflict_count"], 0)
+        self.assertTrue(preview["batch_id"].startswith("RB-"))
+
+        result = guards.submit_review_batch(self.conn, payload)
+        batch_id = result["batch_id"]
+        self.assertEqual(preview["batch_id"], batch_id)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["applied_count"], 2)
+        self.assertTrue(all(x["result"] == "applied"
+                            for x in result["items"]))
+        for f in chosen:
+            hist = guards.finding_history(self.conn, f["finding_id"])
+            self.assertEqual(hist["finding"]["status"], "accepted")
+            self.assertEqual(len(hist["history"]), 1)
+            self.assertEqual(hist["history"][0]["reviewer"], "张三")
+
+        # 网络重试：同一请求确定性映射到同一批次，返回首次结果且不重复处理。
+        replay = guards.submit_review_batch(self.conn, payload)
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(replay["batch_id"], batch_id)
+        fetched = guards.get_review_batch(self.conn, batch_id)
+        self.assertEqual(fetched["status"], "completed")
+        self.assertEqual(len(fetched["items"]), 2)
+        for f in chosen:
+            hist = guards.finding_history(self.conn, f["finding_id"])
+            self.assertEqual(len(hist["history"]), 1)
+
+    def test_30_batch_conflict_is_atomic_persisted_and_recoverable(self):
+        self.build_with_anomalies()
+        pending = guards.list_findings(
+            self.conn, device_id=self.dev["device_id"], status="pending")
+        first, untouched = pending[0], pending[1]
+        # 另一请求先处理第一项，使批量请求的读取版本过期。
+        guards.review_finding(self.conn, first["finding_id"], {
+            "action": "reject", "reviewer": "李四", "review_seq": 0})
+        payload = {
+            "action": "accept", "reviewer": "张三", "note": "批量",
+            "items": [
+                {"finding_id": first["finding_id"], "review_seq": 0},
+                {"finding_id": untouched["finding_id"], "review_seq": 0},
+            ],
+        }
+        with self.assertRaises(ApiError) as cm:
+            guards.submit_review_batch(self.conn, payload)
+        self.assertEqual(cm.exception.status, 409)
+        self.assertEqual(cm.exception.error, "review_batch_conflict")
+        batch = cm.exception.extra["batch"]
+        self.assertEqual(batch["status"], "conflict")
+        self.assertEqual(batch["applied_count"], 0)
+        self.assertEqual(batch["conflict_count"], 1)
+        self.assertEqual(batch["conflicts"][0]["finding_id"],
+                         first["finding_id"])
+        self.assertEqual(batch["conflicts"][0]["conflict_reason"],
+                         "already_reviewed")
+
+        # 任一项冲突则整体不变：第二项仍是 pending，且没有历史。
+        after = guards.finding_history(self.conn, untouched["finding_id"])
+        self.assertEqual(after["finding"]["status"], "pending")
+        self.assertEqual(after["finding"]["review_seq"], 0)
+        self.assertEqual(after["history"], [])
+
+        # 冲突批次同样持久化；响应丢失后可用批次号恢复，或重放取得原冲突。
+        fetched = guards.get_review_batch(self.conn, batch["batch_id"])
+        self.assertEqual(fetched["conflicts"], batch["conflicts"])
+        with self.assertRaises(ApiError) as cm2:
+            guards.submit_review_batch(self.conn, payload)
+        self.assertEqual(cm2.exception.error, "review_batch_conflict")
+        self.assertTrue(cm2.exception.extra["batch"]["idempotent_replay"])
+        self.assertEqual(
+            cm2.exception.extra["batch"]["batch_id"], batch["batch_id"])
+
+    def test_31_batch_return_rebuilds_timeline_once_per_device(self):
+        self.build_with_anomalies()
+        pending = guards.list_findings(
+            self.conn, device_id=self.dev["device_id"], status="pending")
+        payload = {
+            "action": "return", "reviewer": "王五",
+            "note": "整批退回重算",
+            "items": [{"finding_id": f["finding_id"],
+                       "review_seq": f["review_seq"]} for f in pending],
+        }
+        result = guards.submit_review_batch(self.conn, payload)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["applied_count"], len(pending))
+        # 同设备多个退回项只重建一次时间线。
+        self.assertEqual(len(result["recomputes"]), 1)
+        self.assertGreater(result["recomputes"][0]["finding_count"], 0)
+        for f in pending:
+            hist = guards.finding_history(self.conn, f["finding_id"])
+            self.assertEqual(hist["finding"]["status"], "returned")
+            self.assertEqual(len(hist["history"]), 1)
+        new_pending = guards.list_findings(
+            self.conn, device_id=self.dev["device_id"], status="pending")
+        self.assertEqual(len(new_pending),
+                         result["recomputes"][0]["finding_count"])
+
+    def test_32_concurrent_duplicate_batch_has_one_application(self):
+        self.build_with_anomalies()
+        pending = guards.list_findings(
+            self.conn, device_id=self.dev["device_id"], status="pending")
+        chosen = pending[:2]
+        payload = {
+            "action": "accept", "reviewer": "张三", "note": "并发批量",
+            "items": [{"finding_id": f["finding_id"],
+                       "review_seq": f["review_seq"]} for f in chosen],
+        }
+        outcomes = []
+        barrier = threading.Barrier(2)
+
+        def worker():
+            # 已有测试库是 WAL；这里不能再次执行 PRAGMA journal_mode=WAL：
+            # 该 pragma 需要排他锁且不受 busy_timeout 保护，可能直接报
+            # database is locked，使线程到不了 barrier。
+            conn = sqlite3.connect(
+                self.path, timeout=30, isolation_level=None,
+                check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA busy_timeout = 30000")
+            barrier.wait()
+            try:
+                outcomes.append(("ok", guards.submit_review_batch(
+                    conn, payload)["batch_id"]))
+            except ApiError as e:
+                outcomes.append((e.error, e.extra.get("batch", {})))
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual({x[0] for x in outcomes}, {"ok"})
+        self.assertEqual({x[1] for x in outcomes}, {outcomes[0][1]})
+        for f in chosen:
+            hist = guards.finding_history(self.conn, f["finding_id"])
+            self.assertEqual(len(hist["history"]), 1)
+
+    def test_33_batch_return_recompute_failure_rolls_back_whole_batch(self):
+        self.build_with_anomalies()
+        pending = guards.list_findings(
+            self.conn, device_id=self.dev["device_id"], status="pending")
+        versions_before = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM timeline_versions").fetchone()["c"]
+        batches_before = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM review_batches").fetchone()["c"]
+        from app import detect
+        original = detect.find_anomalies
+        detect.find_anomalies = lambda events: (_ for _ in ()).throw(
+            RuntimeError("batch detector exploded"))
+        try:
+            with self.assertRaises(RuntimeError):
+                guards.submit_review_batch(self.conn, {
+                    "action": "return", "reviewer": "王五",
+                    "items": [{"finding_id": f["finding_id"],
+                               "review_seq": f["review_seq"]}
+                              for f in pending]})
+        finally:
+            detect.find_anomalies = original
+        for f in pending:
+            hist = guards.finding_history(self.conn, f["finding_id"])
+            self.assertEqual(hist["finding"]["status"], "pending")
+            self.assertEqual(hist["finding"]["review_seq"], 0)
+            self.assertEqual(hist["history"], [])
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) AS c FROM timeline_versions"
+        ).fetchone()["c"], versions_before)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) AS c FROM review_batches"
+        ).fetchone()["c"], batches_before)
+
     # -- 版本不可变 -----------------------------------------------------------
     def test_13_referenced_version_cannot_be_overwritten(self):
         r = self.build_with_anomalies()
@@ -992,6 +1178,35 @@ class HttpSmokeTest(unittest.TestCase):
             {"action": "reject", "reviewer": "李四",
              "review_seq": f["review_seq"]})
         self.assertEqual(status, 409)
+
+        # 批量复核：预览发现过期项 → 原子冲突留痕；重复提交与批次号查询均能恢复
+        batch_payload = {
+            "action": "accept", "reviewer": "张三", "note": "HTTP 批量复核",
+            "items": [{"finding_id": f["finding_id"],
+                       "review_seq": f["review_seq"]}],
+        }
+        status, preview = self.api(
+            "POST", "/api/review-batches/preview", batch_payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(preview["conflict_count"], 1)
+        self.assertEqual(preview["conflicts"][0]["conflict_reason"],
+                         "already_reviewed")
+        status, batch_conflict = self.api(
+            "POST", "/api/review-batches/submit", batch_payload)
+        self.assertEqual(status, 409)
+        self.assertEqual(batch_conflict["error"], "review_batch_conflict")
+        review_batch_id = batch_conflict["batch"]["batch_id"]
+        self.assertEqual(batch_conflict["batch"]["applied_count"], 0)
+        status, replay = self.api(
+            "POST", "/api/review-batches/submit", batch_payload)
+        self.assertEqual(status, 409)
+        self.assertEqual(replay["batch"]["batch_id"], review_batch_id)
+        self.assertTrue(replay["batch"]["idempotent_replay"])
+        status, recovered = self.api(
+            "GET", f"/api/review-batches/{review_batch_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(recovered["batch_id"], review_batch_id)
+        self.assertEqual(recovered["status"], "conflict")
 
         status, exported = self.api("POST", "/api/reports/export", {
             "device_id": device_id, "version_id": built["version_id"]})

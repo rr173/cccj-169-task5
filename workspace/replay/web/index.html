@@ -118,10 +118,44 @@
           <option value="returned">已退回重算</option>
         </select>
       </label>
+      <label>异常类型
+        <select id="finding-type-filter">
+          <option value="">全部</option>
+          <option value="continuous_overlimit">连续超限</option>
+          <option value="gap">缺失区间</option>
+          <option value="meter_jump">计量跳变</option>
+        </select>
+      </label>
       <label>复核人 <input id="reviewer" value="张三" style="width:7em"></label>
     </div>
+
+    <div class="batch-bar">
+      <label class="inline-check"><input id="select-all-findings"
+                                         type="checkbox"> 勾选当前筛选结果</label>
+      <span id="selected-count" class="muted">已选 0 项</span>
+      <label>批量动作
+        <select id="batch-action">
+          <option value="accept">接受</option>
+          <option value="reject">驳回</option>
+          <option value="return">退回重算</option>
+        </select>
+      </label>
+      <input id="batch-note" placeholder="批量备注（可选）" style="flex:1;min-width:220px">
+      <button id="preview-batch" type="button">预览批次</button>
+    </div>
+
+    <div id="batch-preview" class="batch-preview hidden"></div>
+
+    <div class="inline-form">
+      <input id="batch-lookup" placeholder="按批次号查询，如 RB-…"
+             style="width:24em">
+      <button id="lookup-batch" type="button" class="ghost">查询/恢复批次</button>
+      <span id="batch-lookup-result" class="muted"></span>
+    </div>
+
     <table id="finding-table">
       <thead><tr>
+        <th><input type="checkbox" disabled title="使用上方全选"></th>
         <th>复核项</th><th>类型</th><th>流</th><th>时间区间（校正后）</th>
         <th>详情</th><th>状态</th><th>版本</th><th>操作</th>
       </tr></thead>

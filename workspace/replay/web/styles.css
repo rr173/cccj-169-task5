@@ -64,6 +64,35 @@ button.ghost { background: var(--panel2); color: var(--text);
   border: 1px solid var(--line); }
 button.danger { background: var(--bad); }
 button.warn { background: var(--warn); }
+.inline-check { display: inline-flex; gap: 6px; align-items: center; }
+.batch-bar {
+  display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+  padding: 10px 12px; margin: 10px 0;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
+}
+.batch-preview {
+  background: var(--panel); border: 1px solid var(--line);
+  border-left: 4px solid var(--accent); border-radius: 4px;
+  padding: 12px; margin: 10px 0;
+}
+.batch-preview.ok { border-left-color: var(--ok); }
+.batch-preview.bad { border-left-color: var(--bad); }
+.batch-head {
+  display: flex; justify-content: space-between; gap: 12px;
+  align-items: center; flex-wrap: wrap; margin-bottom: 8px;
+}
+.batch-conflict {
+  color: var(--bad); border-left: 3px solid var(--bad);
+  padding: 6px 10px; background: var(--panel2); margin: 8px 0;
+}
+.batch-actions {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 12px; margin-top: 10px; flex-wrap: wrap;
+}
+table.mini { font-size: 12px; margin: 8px 0 0; }
+table.mini tr.applied td { color: var(--ok); }
+table.mini tr.conflict td { color: var(--bad); }
+table.mini tr.ready td { color: var(--text); }
 input, select, textarea {
   background: var(--panel2); color: var(--text);
   border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px;

@@ -117,6 +117,47 @@ CREATE TABLE IF NOT EXISTS review_history (
     created_at  TEXT NOT NULL
 );
 
+-- 批量复核：批次号由请求内容（动作/复核人/备注/逐项 review_seq）
+-- 的规范化 JSON 哈希确定性生成，因此同一批次网络重试不会产生第二批次。
+-- 冲突批次也留痕，重复提交可原样取回首次冲突明细。
+CREATE TABLE IF NOT EXISTS review_batches (
+    batch_id        TEXT PRIMARY KEY,
+    request_sha256  TEXT NOT NULL,
+    action          TEXT NOT NULL CHECK(action IN ('accept','reject','return')),
+    reviewer        TEXT NOT NULL,
+    note            TEXT,
+    request_json    TEXT NOT NULL,
+    status          TEXT NOT NULL CHECK(status IN ('completed','conflict')),
+    total_count     INTEGER NOT NULL,
+    applied_count   INTEGER NOT NULL,
+    conflict_count  INTEGER NOT NULL,
+    recompute_json  TEXT NOT NULL DEFAULT '[]',
+    result_json     TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    completed_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS review_batch_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id        TEXT NOT NULL REFERENCES review_batches(batch_id),
+    item_index      INTEGER NOT NULL,
+    finding_id      TEXT NOT NULL,
+    device_id       TEXT,
+    version_id      TEXT,
+    ftype           TEXT,
+    requested_seq   INTEGER NOT NULL,
+    current_seq     INTEGER,
+    result          TEXT NOT NULL CHECK(result IN
+                        ('ready','applied','conflict')),
+    target_status   TEXT,
+    conflict_reason TEXT,
+    reviewed_at     TEXT,
+    UNIQUE(batch_id, item_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_batch_items_finding
+    ON review_batch_items(finding_id);
+
 -- 审计报告：payload 规范化 JSON + 设备密钥 HMAC-SHA256 签名
 CREATE TABLE IF NOT EXISTS reports (
     report_id   TEXT PRIMARY KEY,
@@ -226,7 +267,11 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
+    # 查询当前模式后再切换：已在 WAL 模式的库重复执行写形式 pragma 需要
+    # 排他锁，在并发请求中可能立即 locked；查询模式不会触发锁升级。
+    current_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    if str(current_mode).lower() != "wal":
+        conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 

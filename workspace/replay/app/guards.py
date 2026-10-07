@@ -13,6 +13,9 @@ Invariants enforced:
     兜底，应用层也从不原地改写）。
   * 复核是 CAS：``UPDATE ... WHERE status='pending' AND review_seq=?``，
     并发复核同一项只有一个成功，其余 409。
+  * 批量复核在同一个 BEGIN IMMEDIATE 事务中校验全部 review_seq；任一冲突
+    则整批不变，成功/冲突批次均持久化，并由请求哈希生成确定性批次号以支持
+    幂等重放与按批次号恢复。
   * 退回重算与状态变更同事务：重算失败整体回滚，复核项回到 pending。
   * 审计报告用设备密钥 HMAC-SHA256 签名；跨设备加载或内容被篡改一律拒绝。
 """
@@ -475,7 +478,8 @@ def _finding_view(row: sqlite3.Row) -> dict:
 
 
 def list_findings(conn: sqlite3.Connection, device_id: str | None = None,
-                  status: str | None = None) -> list[dict]:
+                  status: str | None = None,
+                  ftype: str | None = None) -> list[dict]:
     sql = ("SELECT f.*, v.algo_version, v.status AS version_status "
            "FROM findings f JOIN timeline_versions v "
            "  ON v.version_id = f.version_id")
@@ -486,6 +490,9 @@ def list_findings(conn: sqlite3.Connection, device_id: str | None = None,
     if status:
         cond.append("f.status = ?")
         args.append(status)
+    if ftype:
+        cond.append("f.ftype = ?")
+        args.append(ftype)
     if cond:
         sql += " WHERE " + " AND ".join(cond)
     sql += " ORDER BY f.created_at DESC, f.finding_id DESC"
@@ -548,6 +555,288 @@ def finding_history(conn: sqlite3.Connection, finding_id: str) -> dict:
         "WHERE finding_id = ? ORDER BY id", (finding_id,)).fetchall()
     return {"finding": _finding_view(f),
             "history": [dict(r) for r in rows]}
+
+
+# ---------------------------------------------------------------------------
+# 批量复核：预览 / 原子提交 / 确定性批次号 / 冲突留痕与恢复
+# ---------------------------------------------------------------------------
+
+def _review_batch_input(body: dict) -> tuple[str, str, str | None, list[dict],
+                                              str, str]:
+    """规范化批量请求并确定性生成可追踪批次号。"""
+    action = body.get("action")
+    if action not in REVIEW_ACTIONS:
+        raise ApiError(422, "invalid_action",
+                       "action 必须是 accept / reject / return")
+    reviewer = _str(body.get("reviewer"), "reviewer")
+    note = body.get("note")
+    if note is not None and not isinstance(note, str):
+        raise ApiError(422, "invalid_note", "note 必须是字符串")
+    raw_items = body.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        raise ApiError(422, "invalid_items", "items 必须是非空数组")
+    seen: set[str] = set()
+    items: list[dict] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            raise ApiError(422, "invalid_item", "每个复核项必须是对象")
+        finding_id = _str(raw.get("finding_id"), "finding_id")
+        if finding_id in seen:
+            raise ApiError(422, "duplicate_item",
+                           f"复核项 {finding_id} 在批次中重复")
+        seen.add(finding_id)
+        seq = _int(raw.get("review_seq"), "review_seq", minimum=0)
+        items.append({"finding_id": finding_id, "review_seq": seq})
+    items.sort(key=lambda x: x["finding_id"])
+    request = {"action": action, "reviewer": reviewer,
+               "note": note or "", "items": items}
+    request_text = canonical(request)
+    request_sha = sha256_text(request_text)
+    batch_id = f"RB-{request_sha[:20].upper()}"
+    return action, reviewer, note, items, request_text, batch_id
+
+
+def _preview_item(row: sqlite3.Row | None, item: dict, action: str) -> dict:
+    target_status = REVIEW_ACTIONS[action]
+    if row is None:
+        return {
+            "finding_id": item["finding_id"], "result": "conflict",
+            "requested_seq": item["review_seq"], "current_seq": None,
+            "current_status": None, "target_status": target_status,
+            "conflict_reason": "finding_not_found",
+        }
+    reason = None
+    if row["status"] != "pending":
+        reason = "already_reviewed"
+    elif row["review_seq"] != item["review_seq"]:
+        reason = "stale_review_seq"
+    return {
+        "finding_id": row["finding_id"], "device_id": row["device_id"],
+        "version_id": row["version_id"], "ftype": row["ftype"],
+        "kind": row["kind"], "start_ts": row["start_ts"],
+        "end_ts": row["end_ts"], "detail": json.loads(row["detail"]),
+        "current_status": row["status"],
+        "requested_seq": item["review_seq"],
+        "current_seq": row["review_seq"],
+        "target_status": target_status,
+        "result": "ready" if reason is None else "conflict",
+        "conflict_reason": reason,
+    }
+
+
+def preview_review_batch(conn: sqlite3.Connection, body: dict) -> dict:
+    """只读预览提交结果；不锁库、不落批次，提交时仍会重新做权威 CAS 校验。"""
+    action, reviewer, note, items, _, batch_id = _review_batch_input(body)
+    ids = [x["finding_id"] for x in items]
+    rows = {r["finding_id"]: r for r in conn.execute(
+        "SELECT * FROM findings WHERE finding_id IN ({})".format(
+            ",".join("?" for _ in ids)), ids).fetchall()}
+    preview_items = [_preview_item(rows.get(i["finding_id"]), i, action)
+                     for i in items]
+    conflicts = [x for x in preview_items if x["result"] == "conflict"]
+    return {
+        "batch_id": batch_id, "status": "preview", "action": action,
+        "target_status": REVIEW_ACTIONS[action], "reviewer": reviewer,
+        "note": note, "total_count": len(items),
+        "ready_count": len(items) - len(conflicts),
+        "conflict_count": len(conflicts), "items": preview_items,
+        "conflicts": conflicts,
+        "will_recompute_devices": sorted({
+            x["device_id"] for x in preview_items
+            if action == "return" and x["result"] == "ready"}),
+    }
+
+
+def _store_review_batch(conn, *, batch_id, request_text, action, reviewer, note,
+                        status, items, stored_items, recomputes, result, ts):
+    conn.execute(
+        "INSERT INTO review_batches(batch_id, request_sha256, action,"
+        " reviewer, note, request_json, status, total_count,"
+        " applied_count, conflict_count, recompute_json, result_json,"
+        " created_at, completed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (batch_id, result["request_sha256"], action, reviewer, note,
+         request_text, status, len(items),
+         sum(1 for x in stored_items if x["result"] == "applied"),
+         sum(1 for x in stored_items if x["result"] == "conflict"),
+         canonical(recomputes), canonical(result), ts, ts))
+    for idx, x in enumerate(stored_items):
+        conn.execute(
+            "INSERT INTO review_batch_items(batch_id, item_index,"
+            " finding_id, device_id, version_id, ftype, requested_seq,"
+            " current_seq, result, target_status, conflict_reason,"
+            " reviewed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (batch_id, idx, x["finding_id"], x.get("device_id"),
+             x.get("version_id"), x.get("ftype"), x["requested_seq"],
+             x.get("current_seq"), x["result"], x.get("target_status"),
+             x.get("conflict_reason"), x.get("reviewed_at")))
+
+
+def _review_batch_view(conn: sqlite3.Connection,
+                       row: sqlite3.Row | None = None,
+                       batch_id: str | None = None) -> dict:
+    if row is None:
+        row = conn.execute("SELECT * FROM review_batches WHERE batch_id = ?",
+                           (batch_id,)).fetchone()
+        if row is None:
+            raise ApiError(404, "review_batch_not_found",
+                           f"复核批次 {batch_id} 不存在")
+    items = [dict(r) for r in conn.execute(
+        "SELECT item_index, finding_id, device_id, version_id, ftype,"
+        " requested_seq, current_seq, result, target_status,"
+        " conflict_reason, reviewed_at FROM review_batch_items "
+        "WHERE batch_id = ? ORDER BY item_index",
+        (row["batch_id"],)).fetchall()]
+    return {
+        "batch_id": row["batch_id"], "status": row["status"],
+        "action": row["action"], "reviewer": row["reviewer"],
+        "note": row["note"], "request": json.loads(row["request_json"]),
+        "total_count": row["total_count"],
+        "applied_count": row["applied_count"],
+        "conflict_count": row["conflict_count"],
+        "recomputes": json.loads(row["recompute_json"]),
+        "items": items,
+        "conflicts": [x for x in items if x["result"] == "conflict"],
+        "created_at": row["created_at"], "completed_at": row["completed_at"],
+    }
+
+
+def submit_review_batch(conn: sqlite3.Connection, body: dict) -> dict:
+    """原子提交一批同动作复核。
+
+    批次号由规范化请求哈希确定，因此请求未到达、响应丢失或客户端重试时，
+    重复提交返回首次结果。整个批次在一个 ``BEGIN IMMEDIATE`` 事务中执行：
+    任一项不是 pending 或 review_seq 已变化，则不更新任何 finding/history，
+    但会持久化冲突批次和逐项冲突明细，供批次号查询/恢复。
+    """
+    (action, reviewer, note, items, request_text,
+     batch_id) = _review_batch_input(body)
+    request_sha = sha256_text(request_text)
+    ids = [x["finding_id"] for x in items]
+    placeholders = ",".join("?" for _ in ids)
+    conflict_error = None
+    replay_view = None
+
+    _begin(conn)
+    try:
+        # 查重必须在 BEGIN IMMEDIATE 内：两个相同批次并发时，后进入的
+        # writer 会在拿到写锁后看到首个事务已提交的批次，原样返回。
+        prior = conn.execute(
+            "SELECT * FROM review_batches WHERE batch_id = ?",
+            (batch_id,)).fetchone()
+        if prior is not None and prior["request_sha256"] != request_sha:
+            raise ApiError(500, "review_batch_id_collision",
+                           "批次号发生哈希碰撞，请调整请求后重试")
+        if prior is not None:
+            replay_view = _review_batch_view(conn, prior)
+            replay_view["idempotent_replay"] = True
+            if prior["status"] == "conflict":
+                conflict_error = ApiError(
+                    409, "review_batch_conflict",
+                    "批次中存在冲突复核项，整体未变更",
+                    extra={"batch": replay_view})
+                conn.execute("COMMIT")
+            else:
+                conn.execute("COMMIT")
+                return replay_view
+
+        if conflict_error is None:
+            # BEGIN IMMEDIATE 保证本事务是唯一 writer；读取到的 finding 状态和
+            # review_seq 在后续 UPDATE/INSERT/重算期间不会被其他事务改写。
+            rows = {r["finding_id"]: r for r in conn.execute(
+                f"SELECT * FROM findings WHERE finding_id IN ({placeholders})",
+                ids).fetchall()}
+            stored_items: list[dict] = []
+            conflicts: list[dict] = []
+            for requested in items:
+                preview = _preview_item(rows.get(requested["finding_id"]),
+                                        requested, action)
+                if preview["result"] == "conflict":
+                    conflicts.append(preview)
+                stored_items.append(preview)
+            ts = now_iso()
+            result = {
+                "batch_id": batch_id, "request_sha256": request_sha,
+                "status": "conflict" if conflicts else "completed",
+                "action": action, "reviewer": reviewer, "note": note,
+                "total_count": len(items),
+                "applied_count": 0 if conflicts else len(items),
+                "conflict_count": len(conflicts), "items": stored_items,
+                "conflicts": conflicts, "recomputes": [],
+            }
+            if conflicts:
+                _store_review_batch(
+                    conn, batch_id=batch_id, request_text=request_text,
+                    action=action, reviewer=reviewer, note=note,
+                    status="conflict", items=items, stored_items=stored_items,
+                    recomputes=[], result=result, ts=ts)
+                conn.execute("COMMIT")
+                conflict_error = ApiError(
+                    409, "review_batch_conflict",
+                    "批次中存在冲突复核项，整体未变更",
+                    extra={"batch": _review_batch_view(
+                        conn, batch_id=batch_id)})
+            else:
+                target_status = REVIEW_ACTIONS[action]
+                for requested in items:
+                    finding_id = requested["finding_id"]
+                    seq = requested["review_seq"]
+                    cur = conn.execute(
+                        "UPDATE findings SET status = ?, reviewer = ?,"
+                        " review_note = ?, reviewed_at = ?,"
+                        " review_seq = review_seq + 1 "
+                        "WHERE finding_id = ? AND status = 'pending' "
+                        "AND review_seq = ?",
+                        (target_status, reviewer, note, ts, finding_id, seq))
+                    if cur.rowcount != 1:
+                        # 防御性分支：BEGIN IMMEDIATE 下理论上不会发生。若发生，
+                        # raise 触发 ROLLBACK，保证绝不部分应用。
+                        raise ApiError(409, "review_conflict",
+                                       f"复核项 {finding_id} 已过期，请刷新后重试")
+                    conn.execute(
+                        "INSERT INTO review_history(finding_id, action,"
+                        " reviewer, note, created_at) VALUES (?,?,?,?,?)",
+                        (finding_id, action, reviewer, note, ts))
+                    stored = next(x for x in stored_items
+                                  if x["finding_id"] == finding_id)
+                    stored.update({"result": "applied",
+                                   "target_status": target_status,
+                                   "current_seq": seq + 1,
+                                   "reviewed_at": ts})
+
+                recomputes = []
+                if action == "return":
+                    seen_devices: set[str] = set()
+                    for row in rows.values():
+                        if row["device_id"] in seen_devices:
+                            continue
+                        seen_devices.add(row["device_id"])
+                        recomputes.append(_build_timeline(conn, row["device_id"]))
+
+                result["recomputes"] = recomputes
+                _store_review_batch(
+                    conn, batch_id=batch_id, request_text=request_text,
+                    action=action, reviewer=reviewer, note=note,
+                    status="completed", items=items,
+                    stored_items=stored_items, recomputes=recomputes,
+                    result=result, ts=ts)
+                log_event(conn, None, "review_batch_submitted",
+                          {"batch_id": batch_id, "action": action,
+                           "reviewer": reviewer, "count": len(items),
+                           "devices": sorted(
+                               {r["device_id"] for r in rows.values()})})
+                conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    if conflict_error is not None:
+        raise conflict_error
+    view = _review_batch_view(conn, batch_id=batch_id)
+    view["recomputes"] = recomputes
+    return view
+
+
+def get_review_batch(conn: sqlite3.Connection, batch_id: str) -> dict:
+    return _review_batch_view(conn, batch_id=batch_id)
 
 
 # ---------------------------------------------------------------------------

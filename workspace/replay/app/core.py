@@ -13,16 +13,19 @@ from .db import now_iso
 class ApiError(Exception):
     """Domain/HTTP error.  ``status`` is the HTTP status code to return."""
 
-    def __init__(self, status: int, error: str, detail: str | None = None):
+    def __init__(self, status: int, error: str, detail: str | None = None,
+                 extra: dict | None = None):
         super().__init__(detail or error)
         self.status = status
         self.error = error
         self.detail = detail
+        self.extra = extra or {}
 
     def to_body(self) -> dict:
         body = {"error": self.error}
         if self.detail:
             body["detail"] = self.detail
+        body.update(self.extra)
         return body
 
 
