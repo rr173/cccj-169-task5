@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>跨设备工艺事件回放与风险处置</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header>
+  <h1>跨设备工艺事件回放与风险处置</h1>
+  <div class="device-bar">
+    <label>当前设备</label>
+    <select id="device-select"></select>
+    <span id="device-meta" class="muted"></span>
+  </div>
+</header>
+
+<nav>
+  <button class="tab active" data-tab="devices">设备</button>
+  <button class="tab" data-tab="import">批次导入</button>
+  <button class="tab" data-tab="timeline">时间线回放</button>
+  <button class="tab" data-tab="review">风险复核</button>
+  <button class="tab" data-tab="reports">审计报告</button>
+  <button class="tab" data-tab="seals">封存包</button>
+</nav>
+
+<main>
+  <!-- 设备 -->
+  <section id="tab-devices" class="panel active">
+    <h2>设备台账</h2>
+    <form id="device-form" class="inline-form">
+      <input id="device-name" placeholder="新设备名称，如：挤出机-C" required>
+      <button type="submit">注册设备</button>
+    </form>
+    <div id="device-secret" class="notice hidden"></div>
+    <table id="device-table">
+      <thead><tr>
+        <th>设备</th><th>名称</th><th>事件数</th><th>版本数</th>
+        <th>待复核</th><th>注册时间</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <!-- 批次导入 -->
+  <section id="tab-import" class="panel">
+    <h2>批次导入（断点续传 · 重复包幂等）</h2>
+    <div class="grid2">
+      <div>
+        <p class="muted">事件 JSON 数组，字段：
+          <code>uid/seq/ts(设备时钟)/kind(temp·pressure·material·sync)/value/server_ts(sync 必填)</code></p>
+        <textarea id="events-input" rows="12"
+                  placeholder='[{"uid":"e1","seq":1,"ts":1000.0,"kind":"temp","value":235.2}, …]'></textarea>
+        <div class="inline-form">
+          <button id="gen-demo" type="button">生成演示事件</button>
+          <label>分块大小 <input id="chunk-size" type="number" value="60"
+                                 min="1" style="width:5em"></label>
+        </div>
+      </div>
+      <div>
+        <div class="inline-form">
+          <button id="upload-start" type="button">开始/续传上传</button>
+          <button id="upload-commit" type="button" disabled>提交批次</button>
+        </div>
+        <div class="progress"><div id="upload-bar"></div></div>
+        <pre id="upload-log" class="log"></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- 时间线回放 -->
+  <section id="tab-timeline" class="panel">
+    <h2>生产时间线（时钟漂移校正 · 可复现）</h2>
+    <div class="inline-form">
+      <button id="build-timeline" type="button">重建时间线（新版本）</button>
+      <span id="build-result" class="muted"></span>
+    </div>
+    <div class="grid2">
+      <div>
+        <h3>校正版本</h3>
+        <table id="version-table">
+          <thead><tr>
+            <th>版本</th><th>算法</th><th>漂移 ppm</th><th>事件</th>
+            <th>复核项</th><th>状态</th><th>创建时间</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div>
+        <h3>事件回放 <span id="replay-version" class="muted"></span></h3>
+        <canvas id="chart" width="640" height="260"></canvas>
+        <input id="replay-slider" type="range" min="0" max="0" value="0"
+               style="width:100%">
+        <div id="replay-label" class="muted">拖动滑块回放事件流</div>
+      </div>
+    </div>
+    <h3>原始事件 ↔ 校正对照</h3>
+    <table id="event-table">
+      <thead><tr>
+        <th>序号</th><th>类型</th><th>数值</th><th>设备时钟 (s)</th>
+        <th>校正时间</th><th>事件 uid</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <!-- 风险复核 -->
+  <section id="tab-review" class="panel">
+    <h2>待复核项（接受 / 驳回 / 退回重算）</h2>
+    <div class="inline-form">
+      <label>状态
+        <select id="finding-filter">
+          <option value="">全部</option>
+          <option value="pending" selected>待复核</option>
+          <option value="accepted">已接受</option>
+          <option value="rejected">已驳回</option>
+          <option value="returned">已退回重算</option>
+        </select>
+      </label>
+      <label>复核人 <input id="reviewer" value="张三" style="width:7em"></label>
+    </div>
+    <table id="finding-table">
+      <thead><tr>
+        <th>复核项</th><th>类型</th><th>流</th><th>时间区间（校正后）</th>
+        <th>详情</th><th>状态</th><th>版本</th><th>操作</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="finding-history" class="notice hidden"></div>
+  </section>
+
+  <!-- 审计报告 -->
+  <section id="tab-reports" class="panel">
+    <h2>审计报告（签名导出 · 防篡改加载）</h2>
+    <div class="grid2">
+      <div>
+        <h3>导出</h3>
+        <div class="inline-form">
+          <label>版本 <select id="report-version"></select></label>
+          <button id="export-report" type="button">导出签名报告</button>
+        </div>
+        <pre id="report-output" class="log"></pre>
+        <button id="download-report" type="button" class="hidden">下载 JSON</button>
+      </div>
+      <div>
+        <h3>验证加载</h3>
+        <textarea id="verify-input" rows="10"
+                  placeholder='粘贴 {"payload":…,"signature":…} 报告 JSON'></textarea>
+        <div class="inline-form">
+          <button id="verify-report" type="button">验证并加载</button>
+        </div>
+        <div id="verify-result" class="notice hidden"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 一次性事件封存包 -->
+  <section id="tab-seals" class="panel">
+    <h2>一次性事件封存包（复核闭环后发放 · 可离线核对）</h2>
+    <div class="grid2">
+      <div>
+        <h3>发放 / 下载</h3>
+        <div class="inline-form">
+          <label>版本 <select id="seal-version"></select></label>
+          <button id="issue-seal" type="button">发放封存包</button>
+        </div>
+        <p class="muted">闸门：版本仍为 active 且该版本全部复核项已闭环。
+          封存后版本进入 <code>sealed</code> 终态；每个（设备 × 版本）
+          只能封存一次，封存包凭<b>一次性令牌</b>只能下载一次。</p>
+        <div id="seal-issued" class="notice hidden"></div>
+        <div class="inline-form">
+          <button id="download-seal" type="button" class="hidden">
+            下载封存包 JSON（令牌随即作废）</button>
+        </div>
+        <h3>发放台账</h3>
+        <table id="seal-table">
+          <thead><tr>
+            <th>封存包</th><th>设备</th><th>版本</th><th>事件</th>
+            <th>复核</th><th>状态</th><th>发放人</th><th>下载时间</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div>
+        <h3>离线核对（命令行）</h3>
+        <pre class="log"># 在没有服务进程、没有数据库的机器上：
+# 1) 只读核对（设备/版本/事件数/完整性证明）
+python3 -m app.sealctl verify 封包.json \
+    --device DEV-XXXX --secret-file device.key
+# 2) 导入本地操作员台账（拒绝重复导入与失效版本）
+python3 -m app.sealctl import 封包.json \
+    --device DEV-XXXX --secret-file device.key
+# 3) 只看头部（不验签）
+python3 -m app.sealctl show 封包.json
+
+# 拒绝码（退出码）：
+#   seal_tampered(3)         封存包被改动
+#   seal_cross_device(4)     换设备使用
+#   seal_duplicate_import(5) 重复导入
+#   seal_version_stale(6)    引用已失效版本</pre>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="muted">event-replay · stdlib only · 时钟校正 / 断点续传 / 幂等 / CAS 复核 / HMAC 签名</footer>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,122 @@
+:root {
+  --bg: #0f1419;
+  --panel: #171e26;
+  --panel2: #1d2630;
+  --line: #2b3644;
+  --text: #d7e0ea;
+  --muted: #7f8ea1;
+  --accent: #4fb3ff;
+  --ok: #43c98a;
+  --warn: #f0b429;
+  --bad: #ef6461;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 14px/1.55 "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+header {
+  display: flex; align-items: baseline; gap: 24px; flex-wrap: wrap;
+  padding: 14px 22px; background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+h1 { font-size: 18px; margin: 0; }
+h2 { font-size: 16px; margin: 0 0 12px; }
+h3 { font-size: 14px; margin: 16px 0 8px; color: var(--muted); }
+.device-bar { display: flex; align-items: center; gap: 8px; }
+nav {
+  display: flex; gap: 4px; padding: 0 22px;
+  background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.tab {
+  background: none; border: none; color: var(--muted);
+  padding: 10px 16px; cursor: pointer; font-size: 14px;
+  border-bottom: 2px solid transparent;
+}
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+main { padding: 18px 22px; }
+.panel { display: none; }
+.panel.active { display: block; }
+.muted { color: var(--muted); }
+.hidden { display: none !important; }
+
+table {
+  width: 100%; border-collapse: collapse; margin: 8px 0 16px;
+  background: var(--panel); font-size: 13px;
+}
+th, td {
+  text-align: left; padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+}
+th { color: var(--muted); font-weight: 500; }
+tr.clickable { cursor: pointer; }
+tr.clickable:hover td { background: var(--panel2); }
+tr.selected td { background: #22303f; }
+
+button {
+  background: var(--accent); color: #06121d; border: none;
+  padding: 7px 14px; border-radius: 4px; cursor: pointer; font-size: 13px;
+}
+button:disabled { opacity: .45; cursor: default; }
+button.ghost { background: var(--panel2); color: var(--text);
+  border: 1px solid var(--line); }
+button.danger { background: var(--bad); }
+button.warn { background: var(--warn); }
+input, select, textarea {
+  background: var(--panel2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px;
+  font: inherit;
+}
+textarea { width: 100%; font-family: ui-monospace, monospace; font-size: 12px; }
+.inline-form {
+  display: flex; gap: 10px; align-items: center;
+  margin: 10px 0; flex-wrap: wrap;
+}
+.grid2 {
+  display: grid; grid-template-columns: 1fr 1fr;
+  gap: 18px; align-items: start;
+}
+@media (max-width: 1000px) { .grid2 { grid-template-columns: 1fr; } }
+
+.notice {
+  background: var(--panel2); border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  padding: 10px 14px; border-radius: 4px; margin: 10px 0;
+  white-space: pre-wrap; word-break: break-all;
+}
+.notice.ok { border-left-color: var(--ok); }
+.notice.bad { border-left-color: var(--bad); }
+.log {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 4px; padding: 10px; min-height: 120px; max-height: 320px;
+  overflow: auto; font-size: 12px; white-space: pre-wrap;
+  word-break: break-all;
+}
+.progress {
+  height: 8px; background: var(--panel2);
+  border-radius: 4px; overflow: hidden; margin: 8px 0;
+}
+#upload-bar {
+  height: 100%; width: 0; background: var(--accent); transition: width .2s;
+}
+canvas {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 4px; width: 100%;
+}
+.badge {
+  display: inline-block; padding: 1px 8px; border-radius: 10px;
+  font-size: 12px; background: var(--panel2); border: 1px solid var(--line);
+}
+.badge.pending  { color: var(--warn); border-color: var(--warn); }
+.badge.accepted { color: var(--ok);   border-color: var(--ok); }
+.badge.rejected { color: var(--bad);  border-color: var(--bad); }
+.badge.returned { color: var(--accent); border-color: var(--accent); }
+.badge.active   { color: var(--ok);   border-color: var(--ok); }
+.badge.superseded { color: var(--muted); }
+.badge.sealed   { color: var(--accent); border-color: var(--accent); }
+.badge.ready    { color: var(--warn); border-color: var(--warn); }
+.badge.downloaded { color: var(--ok); border-color: var(--ok); }
+footer { padding: 12px 22px; border-top: 1px solid var(--line); }
+code { color: var(--accent); }

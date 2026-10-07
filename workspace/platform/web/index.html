@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>工业三维打印批次追溯与放行平台</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand" onclick="location.hash=''">
+    <span class="logo">▣</span>
+    <div>
+      <h1>工业三维打印批次追溯与放行平台</h1>
+      <span class="sub">作业冻结快照 · 逐层回执 · 物料守恒 · 唯一终态放行</span>
+    </div>
+  </div>
+  <nav>
+    <button class="btn ghost" id="nav-jobs">作业列表</button>
+    <button class="btn primary" id="nav-new">＋ 新建打印作业</button>
+  </nav>
+</header>
+<main id="app"></main>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
