@@ -704,6 +704,278 @@ class ReplayTest(unittest.TestCase):
             sealmod.parse_envelope({"format": "weird"})
         self.assertEqual(cm.exception.code, "seal_malformed")
 
+    # -- 批量复核 -----------------------------------------------------------
+    def _pending(self):
+        return guards.list_findings(
+            self.conn, device_id=self.dev["device_id"], status="pending")
+
+    def _batch_body(self, findings, action="accept", key="cli-1",
+                    reviewer="张三"):
+        return {"client_key": key, "reviewer": reviewer, "note": "批量处理",
+                "items": [{"finding_id": f["finding_id"], "action": action,
+                           "review_seq": f["review_seq"]} for f in findings]}
+
+    def test_29_batch_review_applies_all_and_is_traceable(self):
+        self.build_with_anomalies()
+        pending = self._pending()
+        self.assertGreaterEqual(len(pending), 3)
+        body = self._batch_body(pending[:2], "accept")
+        body["items"].append({"finding_id": pending[2]["finding_id"],
+                              "action": "reject",
+                              "review_seq": pending[2]["review_seq"]})
+        r = guards.review_batch(self.conn, body)
+        self.assertTrue(r["batch_id"].startswith("RB-"))
+        self.assertEqual(r["item_count"], 3)
+        self.assertEqual(r["client_key"], "cli-1")
+        self.assertEqual([x["status"] for x in r["results"]],
+                         ["accepted", "accepted", "rejected"])
+        # 逐项状态与处理历史（含批次号）落库
+        for it in r["results"]:
+            h = guards.finding_history(self.conn, it["finding_id"])
+            self.assertEqual(h["finding"]["status"], it["status"])
+            self.assertEqual(len(h["history"]), 1)
+            self.assertEqual(h["history"][0]["batch_id"], r["batch_id"])
+        # 批次号可追踪：按批次号查询返回同样的逐项结果
+        got = guards.get_review_batch(self.conn, r["batch_id"])
+        self.assertEqual(got["results"], r["results"])
+        # 台账列表（不含逐项结果）
+        listing = guards.list_review_batches(
+            self.conn, device_id=self.dev["device_id"])
+        self.assertEqual([b["batch_id"] for b in listing], [r["batch_id"]])
+        self.assertNotIn("results", listing[0])
+
+    def test_30_batch_conflict_rolls_back_everything_with_details(self):
+        self.build_with_anomalies()
+        pending = self._pending()
+        a, b, c = pending[0], pending[1], pending[2]
+        # 制造两种冲突：b 已被单项复核处理；c 的 review_seq 过期
+        guards.review_finding(self.conn, b["finding_id"], {
+            "action": "accept", "reviewer": "李四",
+            "review_seq": b["review_seq"]})
+        body = {"client_key": "cli-conflict", "reviewer": "张三",
+                "items": [
+                    {"finding_id": a["finding_id"], "action": "accept",
+                     "review_seq": a["review_seq"]},
+                    {"finding_id": b["finding_id"], "action": "accept",
+                     "review_seq": b["review_seq"]},
+                    {"finding_id": c["finding_id"], "action": "reject",
+                     "review_seq": c["review_seq"] + 9}]}
+        with self.assertRaises(ApiError) as cm:
+            guards.review_batch(self.conn, body)
+        e = cm.exception
+        self.assertEqual(e.status, 409)
+        self.assertEqual(e.error, "review_batch_conflict")
+        conf = {x["finding_id"]: x for x in e.extra["conflicts"]}
+        self.assertEqual(set(conf), {b["finding_id"], c["finding_id"]})
+        self.assertEqual(conf[b["finding_id"]]["current_status"], "accepted")
+        self.assertEqual(conf[b["finding_id"]]["current_review_seq"],
+                         b["review_seq"] + 1)
+        self.assertEqual(conf[c["finding_id"]]["current_status"], "pending")
+        self.assertEqual(conf[c["finding_id"]]["expected_review_seq"],
+                         c["review_seq"] + 9)
+        # 整批不变：无冲突的 a 也保持 pending、无历史、无批次记录
+        ha = guards.finding_history(self.conn, a["finding_id"])
+        self.assertEqual(ha["finding"]["status"], "pending")
+        self.assertEqual(len(ha["history"]), 0)
+        self.assertEqual(guards.list_review_batches(self.conn), [])
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) AS c FROM review_batches").fetchone()["c"], 0)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) AS c FROM review_batch_items").fetchone()["c"],
+            0)
+        # 修正数据后同一批复（新 client_key）可重新提交
+        fixed = {"client_key": "cli-conflict-2", "reviewer": "张三",
+                 "items": [
+                     {"finding_id": a["finding_id"], "action": "accept",
+                      "review_seq": a["review_seq"]},
+                     {"finding_id": c["finding_id"], "action": "reject",
+                      "review_seq": c["review_seq"]}]}
+        r = guards.review_batch(self.conn, fixed)
+        self.assertEqual(r["item_count"], 2)
+
+    def test_31_batch_replay_is_idempotent_and_key_conflict_rejected(self):
+        self.build_with_anomalies()
+        pending = self._pending()
+        body = self._batch_body(pending[:2], "accept", key="cli-idem")
+        first = guards.review_batch(self.conn, body)
+        # 相同键 + 相同载荷重试（模拟断网重发）→ 返回首次结果，不重复应用
+        replay = guards.review_batch(
+            self.conn, json.loads(json.dumps(body)))
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(replay["batch_id"], first["batch_id"])
+        self.assertEqual(replay["results"], first["results"])
+        for f in pending[:2]:
+            h = guards.finding_history(self.conn, f["finding_id"])
+            self.assertEqual(len(h["history"]), 1)   # 历史没有翻倍
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) AS c FROM review_batches").fetchone()["c"], 1)
+        # 相同键 + 不同载荷 → 409 batch_key_conflict
+        other = self._batch_body(pending[2:3], "reject", key="cli-idem")
+        with self.assertRaises(ApiError) as cm:
+            guards.review_batch(self.conn, other)
+        self.assertEqual(cm.exception.status, 409)
+        self.assertEqual(cm.exception.error, "batch_key_conflict")
+        # 被拒的载荷没有应用
+        self.assertEqual(guards.finding_history(
+            self.conn, pending[2]["finding_id"])["finding"]["status"],
+            "pending")
+
+    def test_32_batch_recoverable_by_batch_id_and_client_key(self):
+        self.build_with_anomalies()
+        pending = self._pending()
+        body = self._batch_body(pending[:2], "accept", key="cli-recover")
+        first = guards.review_batch(self.conn, body)
+        # 模拟提交后断网：只凭 client_key 找回批次号与逐项结果
+        by_key = guards.get_review_batch_by_key(self.conn, "cli-recover")
+        self.assertEqual(by_key["batch_id"], first["batch_id"])
+        self.assertEqual(by_key["results"], first["results"])
+        by_id = guards.get_review_batch(self.conn, first["batch_id"])
+        self.assertEqual(by_id, by_key)
+        with self.assertRaises(ApiError) as cm:
+            guards.get_review_batch(self.conn, "RB-999")
+        self.assertEqual(cm.exception.status, 404)
+        self.assertEqual(cm.exception.error, "review_batch_not_found")
+        with self.assertRaises(ApiError) as cm:
+            guards.get_review_batch_by_key(self.conn, "no-such-key")
+        self.assertEqual(cm.exception.status, 404)
+
+    def test_33_batch_return_recomputes_once_and_failure_rolls_back(self):
+        self.build_with_anomalies()
+        pending = self._pending()
+        versions_before = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM timeline_versions").fetchone()["c"]
+        # 两项退回同一设备 → 同一事务内只重算一次（一个新版本）
+        r = guards.review_batch(
+            self.conn, self._batch_body(pending[:2], "return", key="cli-ret"))
+        self.assertEqual([x["status"] for x in r["results"]],
+                         ["returned", "returned"])
+        self.assertEqual(len(r["recompute"]), 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) AS c FROM timeline_versions").fetchone()["c"],
+            versions_before + 1)
+        # 重算结果随批次落库：恢复查询同样可见
+        got = guards.get_review_batch(self.conn, r["batch_id"])
+        self.assertEqual(got["recompute"], r["recompute"])
+        # 重算中途失败 → 整批回滚：状态、历史、批次记录全都不留
+        new_pending = [f for f in self._pending()
+                       if f["version_id"] == r["recompute"][0]["version_id"]]
+        self.assertTrue(new_pending)
+        from app import detect
+        original = detect.find_anomalies
+        detect.find_anomalies = lambda events: (_ for _ in ()).throw(
+            RuntimeError("detector exploded"))
+        try:
+            with self.assertRaises(RuntimeError):
+                guards.review_batch(self.conn, self._batch_body(
+                    new_pending[:1], "return", key="cli-ret-2"))
+        finally:
+            detect.find_anomalies = original
+        after = guards.finding_history(self.conn,
+                                       new_pending[0]["finding_id"])
+        self.assertEqual(after["finding"]["status"], "pending")
+        self.assertEqual(len(after["history"]), 0)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) AS c FROM timeline_versions").fetchone()["c"],
+            versions_before + 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) AS c FROM review_batches").fetchone()["c"], 1)
+
+    def test_34_batch_validation(self):
+        self.build_with_anomalies()
+        f0 = self._pending()[0]
+        with self.assertRaises(ApiError) as cm:
+            guards.review_batch(self.conn, {
+                "client_key": "k", "reviewer": "张三", "items": []})
+        self.assertEqual(cm.exception.error, "invalid_items")
+        with self.assertRaises(ApiError) as cm:
+            guards.review_batch(self.conn, {
+                "client_key": "k", "reviewer": "张三",
+                "items": [{"finding_id": f0["finding_id"],
+                           "action": "accept", "review_seq": 0},
+                          {"finding_id": f0["finding_id"],
+                           "action": "reject", "review_seq": 0}]})
+        self.assertEqual(cm.exception.error, "duplicate_item")
+        with self.assertRaises(ApiError) as cm:
+            guards.review_batch(self.conn, {
+                "client_key": "k", "reviewer": "张三",
+                "items": [{"finding_id": f0["finding_id"],
+                           "action": "maybe", "review_seq": 0}]})
+        self.assertEqual(cm.exception.error, "invalid_action")
+        with self.assertRaises(ApiError) as cm:
+            guards.review_batch(self.conn, {
+                "client_key": "k", "reviewer": "张三",
+                "items": [{"finding_id": "FND-NOPE",
+                           "action": "accept", "review_seq": 0}]})
+        self.assertEqual(cm.exception.status, 404)
+        self.assertEqual(cm.exception.error, "finding_not_found")
+        with self.assertRaises(ApiError) as cm:
+            guards.review_batch(self.conn, {
+                "client_key": "k", "reviewer": "张三",
+                "items": [{"finding_id": f"F{i}", "action": "accept",
+                           "review_seq": 0}
+                          for i in range(guards.MAX_BATCH_ITEMS + 1)]})
+        self.assertEqual(cm.exception.error, "batch_too_large")
+        # 全部校验失败都没有产生批次记录
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) AS c FROM review_batches").fetchone()["c"], 0)
+
+    def test_35_concurrent_batches_only_one_applies(self):
+        self.build_with_anomalies()
+        target = self._pending()[0]
+        conn2 = sqlite3.connect(
+            self.path, timeout=30, isolation_level=None,
+            check_same_thread=False)
+        conn2.row_factory = sqlite3.Row
+        conn2.execute("PRAGMA busy_timeout = 30000")
+        dbmod.init_db(conn2)
+        barrier = threading.Barrier(2)
+        results, errors = [], []
+
+        def submit(conn, key):
+            barrier.wait()
+            try:
+                results.append(guards.review_batch(conn, {
+                    "client_key": key, "reviewer": "张三",
+                    "items": [{"finding_id": target["finding_id"],
+                               "action": "accept", "review_seq": 0}]}))
+            except ApiError as e:
+                errors.append((e.status, e.error))
+
+        t1 = threading.Thread(target=submit, args=(self.conn, "cli-c1"))
+        t2 = threading.Thread(target=submit, args=(conn2, "cli-c2"))
+        t1.start(); t2.start(); t1.join(); t2.join()
+        conn2.close()
+        # 两个批次抢同一项：只有一个整批应用，另一个 409 整批不变
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0], (409, "review_batch_conflict"))
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) AS c FROM review_batches").fetchone()["c"], 1)
+        h = guards.finding_history(self.conn, target["finding_id"])
+        self.assertEqual(h["finding"]["status"], "accepted")
+        self.assertEqual(len(h["history"]), 1)
+
+    def test_36_single_review_and_history_still_work_after_batch(self):
+        self.build_with_anomalies()
+        pending = self._pending()
+        r = guards.review_batch(
+            self.conn, self._batch_body(pending[:1], "accept", key="cli-mix"))
+        fid = pending[0]["finding_id"]
+        # 已批量处理的项再走单项复核 → 409（review_seq 已推进）
+        with self.assertRaises(ApiError) as cm:
+            guards.review_finding(self.conn, fid, {
+                "action": "reject", "reviewer": "李四", "review_seq": 0})
+        self.assertEqual(cm.exception.error, "review_conflict")
+        # 单项复核其它项照常可用，历史与批量记录共存（单项无批次号）
+        other = pending[1]
+        guards.review_finding(self.conn, other["finding_id"], {
+            "action": "accept", "reviewer": "李四",
+            "review_seq": other["review_seq"]})
+        h = guards.finding_history(self.conn, other["finding_id"])
+        self.assertIsNone(h["history"][0]["batch_id"])
+        h = guards.finding_history(self.conn, fid)
+        self.assertEqual(h["history"][0]["batch_id"], r["batch_id"])
+
 
 class SealCliTest(unittest.TestCase):
     """离线命令行核对工具（python3 -m app.sealctl）。
@@ -1058,6 +1330,85 @@ class HttpSmokeTest(unittest.TestCase):
             "version_id": rebuilt["version_id"]})
         self.assertEqual(status, 409)
         self.assertEqual(notclosed["error"], "review_not_closed")
+
+    def test_batch_review_over_http(self):
+        status, dev = self.api("POST", "/api/devices",
+                               {"name": "HTTP-批量复核"})
+        self.assertEqual(status, 200)
+        device_id = dev["device_id"]
+        events = make_events(n=40)
+        chunks = [events[i:i + 20] for i in range(0, len(events), 20)]
+        status, batch = self.api("POST", "/api/batches", {
+            "device_id": device_id,
+            "package_hash": package_hash(events),
+            "total_chunks": len(chunks)})
+        self.assertEqual(status, 200)
+        for i, chunk in enumerate(chunks):
+            self.api("PUT", f"/api/batches/{batch['batch_id']}/chunks/{i}",
+                     {"events": chunk})
+        self.api("POST", f"/api/batches/{batch['batch_id']}/commit")
+        self.api("POST", f"/api/devices/{device_id}/timeline/build")
+        status, found = self.api(
+            "GET", f"/api/findings?device_id={device_id}&status=pending")
+        self.assertEqual(status, 200)
+        items = [{"finding_id": f["finding_id"], "action": "accept",
+                  "review_seq": f["review_seq"]} for f in found["findings"]]
+        self.assertTrue(items)
+
+        # 提交批次 → 批次号 + 逐项结果
+        status, r = self.api("POST", "/api/review-batches", {
+            "client_key": "http-key-1", "reviewer": "张三",
+            "items": items})
+        self.assertEqual(status, 200)
+        self.assertEqual(r["item_count"], len(items))
+        self.assertTrue(r["batch_id"].startswith("RB-"))
+        batch_id = r["batch_id"]
+
+        # 重复提交（同键同载荷）→ 返回原结果
+        status, again = self.api("POST", "/api/review-batches", {
+            "client_key": "http-key-1", "reviewer": "张三",
+            "items": items})
+        self.assertEqual(status, 200)
+        self.assertTrue(again["idempotent_replay"])
+        self.assertEqual(again["batch_id"], batch_id)
+        # 同键不同载荷 → 409
+        status, keyconf = self.api("POST", "/api/review-batches", {
+            "client_key": "http-key-1", "reviewer": "李四",
+            "items": items[:1]})
+        self.assertEqual(status, 409)
+        self.assertEqual(keyconf["error"], "batch_key_conflict")
+
+        # 断网恢复：按批次号 / client_key 查询
+        status, got = self.api("GET", f"/api/review-batches/{batch_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(got["results"], r["results"])
+        status, got2 = self.api(
+            "GET", "/api/review-batches?client_key=http-key-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(got2["batch_id"], batch_id)
+        status, missing = self.api("GET", "/api/review-batches/RB-999")
+        self.assertEqual(status, 404)
+        # 台账
+        status, listing = self.api(
+            "GET", f"/api/review-batches?device_id={device_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["batches"][0]["batch_id"], batch_id)
+
+        # 已处理的项再次提交 → 409 + 逐项冲突明细
+        status, conf = self.api("POST", "/api/review-batches", {
+            "client_key": "http-key-2", "reviewer": "李四",
+            "items": [items[0]]})
+        self.assertEqual(status, 409)
+        self.assertEqual(conf["error"], "review_batch_conflict")
+        self.assertEqual(conf["conflicts"][0]["finding_id"],
+                         items[0]["finding_id"])
+        self.assertEqual(conf["conflicts"][0]["current_status"], "accepted")
+
+        # 单项复核与历史查询照常可用，历史含批次号
+        status, hist = self.api(
+            "GET", f"/api/findings/{items[0]['finding_id']}/history")
+        self.assertEqual(status, 200)
+        self.assertEqual(hist["history"][0]["batch_id"], batch_id)
 
 
 if __name__ == "__main__":

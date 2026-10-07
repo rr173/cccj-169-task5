@@ -107,7 +107,7 @@
 
   <!-- 风险复核 -->
   <section id="tab-review" class="panel">
-    <h2>待复核项（接受 / 驳回 / 退回重算）</h2>
+    <h2>待复核项（单项：接受 / 驳回 / 退回重算 · 批量：勾选后预览提交）</h2>
     <div class="inline-form">
       <label>状态
         <select id="finding-filter">
@@ -118,16 +118,72 @@
           <option value="returned">已退回重算</option>
         </select>
       </label>
+      <label>异常类型
+        <select id="finding-ftype-filter">
+          <option value="">全部</option>
+          <option value="continuous_overlimit">连续超限</option>
+          <option value="gap">缺失区间</option>
+          <option value="meter_jump">计量跳变</option>
+        </select>
+      </label>
       <label>复核人 <input id="reviewer" value="张三" style="width:7em"></label>
+    </div>
+    <div class="inline-form">
+      <button id="batch-open" type="button" disabled>批量复核预览（0）</button>
+      <span class="muted">按条件勾选待复核项后整批提交：服务端在同一事务中
+        校验全部 review_seq，任一项冲突整批不变并返回明细；批次重复提交
+        返回原结果，断网可凭批次号 / client_key 恢复。</span>
     </div>
     <table id="finding-table">
       <thead><tr>
+        <th><input type="checkbox" id="finding-check-all"
+                   title="全选本页待复核项"></th>
         <th>复核项</th><th>类型</th><th>流</th><th>时间区间（校正后）</th>
         <th>详情</th><th>状态</th><th>版本</th><th>操作</th>
       </tr></thead>
       <tbody></tbody>
     </table>
     <div id="finding-history" class="notice hidden"></div>
+
+    <!-- 批量复核预览 -->
+    <div id="batch-preview" class="panel-box hidden">
+      <h3>批量复核预览 <span id="batch-key" class="muted"></span></h3>
+      <div class="inline-form">
+        <label>批次备注 <input id="batch-note" style="width:22em"
+             placeholder="可选，随批次记入逐项处理历史"></label>
+        <button id="batch-all-accept" type="button" class="ghost">全部设为接受</button>
+        <button id="batch-all-reject" type="button" class="ghost">全部设为驳回</button>
+      </div>
+      <table id="batch-preview-table">
+        <thead><tr>
+          <th>复核项</th><th>类型</th><th>流</th><th>时间区间（校正后）</th>
+          <th>读取时 review_seq</th><th>处置</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+      <div id="batch-summary" class="muted"></div>
+      <div class="inline-form">
+        <button id="batch-submit" type="button">提交批次</button>
+        <button id="batch-retry" type="button"
+                class="warn hidden">重试提交（幂等）</button>
+        <button id="batch-cancel" type="button" class="ghost">取消</button>
+      </div>
+    </div>
+    <div id="batch-result" class="notice hidden"></div>
+
+    <h3>复核批次记录（可追踪 · 断网恢复）</h3>
+    <div class="inline-form">
+      <input id="batch-recover-key" style="width:26em"
+             placeholder="批次号 RB-… 或提交时的 client_key">
+      <button id="batch-recover" type="button" class="ghost">查询 / 恢复批次</button>
+    </div>
+    <table id="batch-table">
+      <thead><tr>
+        <th>批次号</th><th>复核人</th><th>项数</th><th>状态</th>
+        <th>提交时间</th><th>操作</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
   </section>
 
   <!-- 审计报告 -->

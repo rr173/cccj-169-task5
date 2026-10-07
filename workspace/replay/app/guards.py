@@ -13,6 +13,9 @@ Invariants enforced:
     兜底，应用层也从不原地改写）。
   * 复核是 CAS：``UPDATE ... WHERE status='pending' AND review_seq=?``，
     并发复核同一项只有一个成功，其余 409。
+  * 批量复核整批一个事务：逐项校验读取时的 review_seq，任一项冲突
+    整批不变并返回冲突明细；client_key 幂等，重复提交返回首次结果，
+    断网后可凭批次号 / client_key 查询恢复。
   * 退回重算与状态变更同事务：重算失败整体回滚，复核项回到 pending。
   * 审计报告用设备密钥 HMAC-SHA256 签名；跨设备加载或内容被篡改一律拒绝。
 """
@@ -26,7 +29,8 @@ from . import detect, seal
 from .clock import correct, fit_clock
 from .core import (ApiError, canonical, log_event, new_batch_id,
                    new_device_id, new_device_secret, new_finding_id,
-                   new_report_id, new_seal_id, new_version_id, sha256_text,
+                   new_report_id, new_review_batch_id, new_seal_id,
+                   new_version_id, sha256_text,
                    sign_device_payload, verify_device_payload)
 from .db import now_iso
 
@@ -36,6 +40,7 @@ EVENT_KINDS = ("temp", "pressure", "material", "sync")
 REVIEW_ACTIONS = {"accept": "accepted",
                   "reject": "rejected",
                   "return": "returned"}
+MAX_BATCH_ITEMS = 500   # 单个复核批次的最大项数（保证事务有界）
 
 
 # ---------------------------------------------------------------------------
@@ -544,10 +549,232 @@ def review_finding(conn: sqlite3.Connection, finding_id: str,
 def finding_history(conn: sqlite3.Connection, finding_id: str) -> dict:
     f = _get_finding(conn, finding_id)
     rows = conn.execute(
-        "SELECT action, reviewer, note, created_at FROM review_history "
-        "WHERE finding_id = ? ORDER BY id", (finding_id,)).fetchall()
+        "SELECT action, reviewer, note, batch_id, created_at "
+        "FROM review_history WHERE finding_id = ? ORDER BY id",
+        (finding_id,)).fetchall()
     return {"finding": _finding_view(f),
             "history": [dict(r) for r in rows]}
+
+
+# ---------------------------------------------------------------------------
+# 批量复核：整批一个事务，全部项校验通过才应用；client_key 幂等可恢复
+# ---------------------------------------------------------------------------
+
+def _review_batch_view(conn: sqlite3.Connection, row: sqlite3.Row,
+                       *, with_results: bool = True) -> dict:
+    view = {
+        "batch_id": row["batch_id"],
+        "client_key": row["client_key"],
+        "reviewer": row["reviewer"],
+        "note": row["note"],
+        "item_count": row["item_count"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+    }
+    if row["recompute"]:
+        view["recompute"] = json.loads(row["recompute"])
+    if with_results:
+        items = conn.execute(
+            "SELECT finding_id, action, review_seq, new_status "
+            "FROM review_batch_items WHERE batch_id = ? ORDER BY rowid",
+            (row["batch_id"],)).fetchall()
+        view["results"] = [
+            {"finding_id": i["finding_id"], "action": i["action"],
+             "status": i["new_status"], "review_seq": i["review_seq"]}
+            for i in items]
+    return view
+
+
+def review_batch(conn: sqlite3.Connection, body: dict) -> dict:
+    """批量复核：同一事务内校验并应用全部复核项。
+
+    * 每项都必须仍是 ``status='pending'`` 且 ``review_seq`` 与客户端读取时
+      一致；任一项不符 → 整批不变，``409 review_batch_conflict`` 并在
+      ``conflicts`` 中给出逐项明细（当前状态 / 当前版本号）；
+    * ``client_key`` 是幂等键：相同键 + 相同载荷重试 → 返回首次结果
+      （``idempotent_replay``，不会重复应用）；相同键 + 不同载荷 →
+      ``409 batch_key_conflict``；
+    * 退回重算（return）按设备去重，每台设备在同一事务内只重建一次
+      时间线；重建失败整批回滚，与单项复核语义一致；
+    * 成功后生成可追踪批次号 ``RB-…``，逐项结果落
+      ``review_batch_items``，处理历史记录批次号。
+    """
+    client_key = _str(body.get("client_key"), "client_key")
+    reviewer = _str(body.get("reviewer"), "reviewer")
+    note = body.get("note")
+    if note is not None and not isinstance(note, str):
+        raise ApiError(422, "invalid_note", "note 必须是字符串")
+    raw_items = body.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        raise ApiError(422, "invalid_items", "items 必须是非空数组")
+    if len(raw_items) > MAX_BATCH_ITEMS:
+        raise ApiError(422, "batch_too_large",
+                       f"单批最多 {MAX_BATCH_ITEMS} 项"
+                       f"（收到 {len(raw_items)} 项）")
+    items, seen = [], set()
+    for i, it in enumerate(raw_items):
+        if not isinstance(it, dict):
+            raise ApiError(422, "invalid_item", f"items[{i}] 必须是对象")
+        fid = _str(it.get("finding_id"), f"items[{i}].finding_id")
+        action = it.get("action")
+        if action not in REVIEW_ACTIONS:
+            raise ApiError(
+                422, "invalid_action",
+                f"items[{i}].action 必须是 accept / reject / return")
+        seq = _int(it.get("review_seq"), f"items[{i}].review_seq", minimum=0)
+        if fid in seen:
+            raise ApiError(422, "duplicate_item",
+                           f"复核项 {fid} 在批次中重复出现")
+        seen.add(fid)
+        items.append({"finding_id": fid, "action": action, "review_seq": seq})
+    request_fp = sha256_text(canonical({
+        "client_key": client_key, "reviewer": reviewer, "note": note,
+        "items": items}))
+    _begin(conn)
+    try:
+        # 幂等：同一 client_key 重复提交返回首次结果（断网重试安全）
+        existing = conn.execute(
+            "SELECT * FROM review_batches WHERE client_key = ?",
+            (client_key,)).fetchone()
+        if existing:
+            if existing["request_sha256"] != request_fp:
+                raise ApiError(
+                    409, "batch_key_conflict",
+                    f"client_key {client_key} 已用于另一批次且载荷不一致；"
+                    "如需新批次请更换 client_key")
+            view = _review_batch_view(conn, existing)
+            view["idempotent_replay"] = True
+            conn.execute("COMMIT")
+            return view
+        # 同一事务内逐项校验读取时的 review_seq：任一冲突整批不变
+        found: dict[str, sqlite3.Row] = {}
+        conflicts = []
+        for it in items:
+            f = conn.execute(
+                "SELECT finding_id, device_id, status, review_seq "
+                "FROM findings WHERE finding_id = ?",
+                (it["finding_id"],)).fetchone()
+            if f is None:
+                raise ApiError(
+                    404, "finding_not_found",
+                    f"复核项 {it['finding_id']} 不存在，整批未应用")
+            found[it["finding_id"]] = f
+            if f["status"] != "pending" \
+                    or f["review_seq"] != it["review_seq"]:
+                conflicts.append({
+                    "finding_id": it["finding_id"],
+                    "expected_review_seq": it["review_seq"],
+                    "current_review_seq": f["review_seq"],
+                    "current_status": f["status"]})
+        if conflicts:
+            raise ApiError(
+                409, "review_batch_conflict",
+                f"{len(conflicts)}/{len(items)} 项已被处理或版本号过期，"
+                "整批未应用，请刷新后重试",
+                extra={"conflicts": conflicts})
+        batch_id = new_review_batch_id(conn)
+        ts = now_iso()
+        results, return_devices = [], []
+        for it in items:
+            new_status = REVIEW_ACTIONS[it["action"]]
+            cur = conn.execute(
+                "UPDATE findings SET status = ?, reviewer = ?,"
+                " review_note = ?, reviewed_at = ?,"
+                " review_seq = review_seq + 1 "
+                "WHERE finding_id = ? AND status = 'pending'"
+                " AND review_seq = ?",
+                (new_status, reviewer, note, ts,
+                 it["finding_id"], it["review_seq"]))
+            if cur.rowcount == 0:
+                # 上面已在同一事务校验，理论上不可达；兜底防御
+                raise ApiError(
+                    409, "review_batch_conflict",
+                    f"复核项 {it['finding_id']} 状态已变化，整批未应用")
+            conn.execute(
+                "INSERT INTO review_history(finding_id, action, reviewer,"
+                " note, batch_id, created_at) VALUES (?,?,?,?,?,?)",
+                (it["finding_id"], it["action"], reviewer, note,
+                 batch_id, ts))
+            results.append({"finding_id": it["finding_id"],
+                            "action": it["action"], "status": new_status,
+                            "review_seq": it["review_seq"]})
+            if it["action"] == "return":
+                dev = found[it["finding_id"]]["device_id"]
+                if dev not in return_devices:
+                    return_devices.append(dev)
+        recompute = []
+        for dev_id in return_devices:
+            # 退回重算：每台设备只重建一次；失败 → 整批回滚
+            recompute.append(_build_timeline(conn, dev_id))
+        conn.execute(
+            "INSERT INTO review_batches(batch_id, client_key, request_sha256,"
+            " reviewer, note, item_count, recompute, status, created_at)"
+            " VALUES (?,?,?,?,?,?,?, 'applied', ?)",
+            (batch_id, client_key, request_fp, reviewer, note, len(items),
+             canonical(recompute) if recompute else None, ts))
+        for it, res in zip(items, results):
+            conn.execute(
+                "INSERT INTO review_batch_items(batch_id, finding_id, action,"
+                " review_seq, new_status) VALUES (?,?,?,?,?)",
+                (batch_id, res["finding_id"], res["action"],
+                 it["review_seq"], res["status"]))
+        devices = {f["device_id"] for f in found.values()}
+        log_event(conn, next(iter(devices)) if len(devices) == 1 else None,
+                  "review_batch_applied",
+                  {"batch_id": batch_id, "items": len(items),
+                   "reviewer": reviewer,
+                   "actions": {a: sum(1 for r in results
+                                      if r["action"] == a)
+                               for a in REVIEW_ACTIONS},
+                   "recomputed_versions": [r["version_id"]
+                                           for r in recompute]})
+        view = _review_batch_view(conn, conn.execute(
+            "SELECT * FROM review_batches WHERE batch_id = ?",
+            (batch_id,)).fetchone())
+        conn.execute("COMMIT")
+        return view
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def get_review_batch(conn: sqlite3.Connection, batch_id: str) -> dict:
+    """按批次号查询批量复核结果（可追踪 / 断网恢复）。"""
+    row = conn.execute(
+        "SELECT * FROM review_batches WHERE batch_id = ?",
+        (batch_id,)).fetchone()
+    if not row:
+        raise ApiError(404, "review_batch_not_found",
+                       f"复核批次 {batch_id} 不存在")
+    return _review_batch_view(conn, row)
+
+
+def get_review_batch_by_key(conn: sqlite3.Connection,
+                            client_key: str) -> dict:
+    """按客户端幂等键查询 —— 提交后断网、没拿到批次号时的恢复入口。"""
+    row = conn.execute(
+        "SELECT * FROM review_batches WHERE client_key = ?",
+        (client_key,)).fetchone()
+    if not row:
+        raise ApiError(404, "review_batch_not_found",
+                       f"没有 client_key 为 {client_key} 的复核批次")
+    return _review_batch_view(conn, row)
+
+
+def list_review_batches(conn: sqlite3.Connection,
+                        device_id: str | None = None) -> list[dict]:
+    """复核批次台账（不含逐项结果；逐项结果用批次号查询）。"""
+    sql = "SELECT * FROM review_batches"
+    args: list = []
+    if device_id:
+        sql += (" WHERE batch_id IN ("
+                "  SELECT rbi.batch_id FROM review_batch_items rbi"
+                "  JOIN findings f ON f.finding_id = rbi.finding_id"
+                "  WHERE f.device_id = ?)")
+        args.append(device_id)
+    sql += " ORDER BY created_at DESC, batch_id DESC"
+    return [_review_batch_view(conn, r, with_results=False)
+            for r in conn.execute(sql, args).fetchall()]
 
 
 # ---------------------------------------------------------------------------

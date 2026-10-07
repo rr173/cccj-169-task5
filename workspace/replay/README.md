@@ -2,8 +2,10 @@
 
 接收打印机产生的**温度 / 压力 / 耗材计量**事件，按设备时钟漂移校正后重建
 **可复现**的生产时间线；从时间线识别**连续超限、缺失区间、计量跳变**三类
-异常并生成待复核项；复核人员可**接受 / 驳回 / 退回重算**；网页展示原始事件、
-校正版本与处理历史；审计报告**签名导出**，跨设备或被篡改的报告拒绝加载。
+异常并生成待复核项；复核人员可**接受 / 驳回 / 退回重算**，风险项较多时
+可按设备与异常类型勾选后**整批提交**（同一事务校验全部读取版本，任一冲突
+整批不变，批次幂等可恢复）；网页展示原始事件、校正版本与处理历史；审计
+报告**签名导出**，跨设备或被篡改的报告拒绝加载。
 
 仅依赖 Python 3.11 标准库（`http.server` + `sqlite3`），无需安装任何第三方包。
 
@@ -18,7 +20,7 @@ python3 -m app 8081              # 启动，浏览器访问 http://localhost:808
 测试：
 
 ```bash
-python3 -m unittest tests.test_replay -v   # 33 个用例（含离线封存包子进程核对）
+python3 -m unittest tests.test_replay -v   # 43 个用例（含离线封存包子进程核对）
 ```
 
 ## 核心不变量（业务红线）
@@ -47,10 +49,18 @@ python3 -m unittest tests.test_replay -v   # 33 个用例（含离线封存包�
 6. **并发复核只保留一个结果**：复核是 CAS 更新
    `UPDATE … WHERE status='pending' AND review_seq=?`，并发/过期提交只有
    一个成功，其余 `409 review_conflict`；历史只记一条（`test_09/10`）。
-7. **审计报告签名**：报告 payload 规范化 JSON 后用**设备密钥** HMAC-SHA256
+7. **批量复核整批事务、幂等可恢复**：批量复核在同一 `BEGIN IMMEDIATE`
+   事务中逐项校验 `review_seq`，**任一项冲突整批不变**并返回逐项冲突明细
+   （`409 review_batch_conflict` + `conflicts[]`，含当前状态与当前版本号）；
+   批次携带客户端 `client_key` 幂等键——重复提交返回首次结果
+   （同键不同载荷 `409 batch_key_conflict`），部分网络中断后可凭**批次号
+   或 client_key** 查询恢复；逐项结果落 `review_batch_items`，处理历史
+   记录批次号，退回重算按设备去重各重建一次（失败整批回滚）；单项复核
+   与历史查询不受影响（`test_29..36`）。
+8. **审计报告签名**：报告 payload 规范化 JSON 后用**设备密钥** HMAC-SHA256
    签名，签名覆盖 `device_id` 等全部字段——跨设备加载 `403 cross_device_report`，
    任何字段被改 `403 signature_mismatch`（`test_15/16/17`）。
-8. **一次性事件封存包**：风险复核全部闭环后，可对「设备 × 当前 active 版本」
+9. **一次性事件封存包**：风险复核全部闭环后，可对「设备 × 当前 active 版本」
    封存**自包含**事件包（内嵌全量校正事件 + 全部复核结论 + 完整性证明，
    设备密钥 HMAC 外层签名）。封存即把版本冻结为终态 `sealed`（重建时间线
    只取代 active 版本；不可变触发器同时覆盖封存包引用）。封存包每个
@@ -103,7 +113,10 @@ python3 -m unittest tests.test_replay -v   # 33 个用例（含离线封存包�
 | POST | `/api/batches/{id}/commit` | 收齐后提交（幂等） |
 | GET | `/api/findings?device_id=&status=` | 复核项列表 |
 | POST | `/api/findings/{id}/review` | 复核 `{action:accept/reject/return, reviewer, note, review_seq}` |
-| GET | `/api/findings/{id}/history` | 处理历史 |
+| GET | `/api/findings/{id}/history` | 处理历史（含批量复核的批次号） |
+| POST | `/api/review-batches` | 批量复核 `{client_key, reviewer, note?, items:[{finding_id, action, review_seq}]}`：同一事务校验全部 `review_seq`，任一冲突整批不变并返回 `conflicts[]`；重复提交返回原结果 |
+| GET | `/api/review-batches/{id}` / `?client_key=` | 按批次号 / 幂等键查询批次与逐项结果（断网恢复） |
+| GET | `/api/review-batches?device_id=` | 复核批次台账 |
 | POST | `/api/reports/export` | 导出签名报告 `{device_id, version_id}` |
 | POST | `/api/reports/verify` | 验证并加载 `{device_id, report}` |
 | POST | `/api/seals/issue` | 复核闭环后封存 `{device_id, version_id, issued_by}`；返回**一次性** download_token |
@@ -133,7 +146,10 @@ python3 -m app.sealctl show    封包.json                     # 只看头部（
 - **批次导入**：粘贴/生成事件 → 分块上传（进度条、断点续传、重复包提示）→ 提交
 - **时间线回放**：版本列表（漂移 ppm、状态）→ 曲线图（温度/压力 + 限值线 +
   超限点标红）→ 滑块回放 → 原始/校正对照表
-- **风险复核**：按状态过滤，接受/驳回/退回重算（409 自动刷新），处理历史
+- **风险复核**：按状态 / 异常类型过滤，单项接受/驳回/退回重算（409 自动刷新）；
+  勾选待复核项 → **批量复核预览**（逐项选处置、批次备注）→ 整批提交
+  （冲突明细逐条展示；断网可原样幂等重试，或凭批次号 / client_key
+  「查询 / 恢复批次」）；批次台账可回看逐项结果，处理历史记录批次号
 - **审计报告**：导出签名报告（可下载 JSON）、粘贴验证加载
 - **封存包**：复核闭环后发放封存包（一次性令牌、立即下载），发放台账，
   离线 `sealctl` 命令用法说明
@@ -150,8 +166,8 @@ app/
   detect.py   连续超限 / 缺失区间 / 计量跳变识别（纯函数）
   guards.py   全部状态迁移（每个迁移一个 BEGIN IMMEDIATE 事务）
   server.py   stdlib HTTP：JSON API + SPA 静态托管
-tests/        33 个端到端不变量用例（含并发复核、失败回滚、HTTP 冒烟、
-                离线封存包子进程核对）
+tests/        43 个端到端不变量用例（含并发复核、批量复核整批事务/幂等/
+                断网恢复、失败回滚、HTTP 冒烟、离线封存包子进程核对）
 seed.py       演示数据（含一份可离线核对的封存包示例）
 web/          index.html / styles.css / app.js（原生 JS SPA）
 ```

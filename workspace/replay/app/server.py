@@ -156,6 +156,24 @@ class Handler(BaseHTTPRequestHandler):
                 return guards.finding_history(conn, p[2])
             raise ApiError(404, "route_not_found", f"未知路径 {path}")
 
+        # /api/review-batches...  批量复核（整批事务 + 幂等 + 断网可恢复）
+        if len(p) >= 2 and p[1] == "review-batches":
+            if len(p) == 2:
+                if method == "POST":
+                    return guards.review_batch(conn, body)
+                if method == "GET":
+                    client_key = (query.get("client_key") or [None])[0]
+                    if client_key:
+                        return guards.get_review_batch_by_key(
+                            conn, client_key)
+                    device_id = (query.get("device_id") or [None])[0]
+                    return {"batches": guards.list_review_batches(
+                        conn, device_id=device_id)}
+                raise ApiError(405, "method_not_allowed")
+            if len(p) == 3 and method == "GET":
+                return guards.get_review_batch(conn, p[2])
+            raise ApiError(404, "route_not_found", f"未知路径 {path}")
+
         # /api/reports...
         if len(p) == 3 and p[1] == "reports":
             if p[2] == "export" and method == "POST":

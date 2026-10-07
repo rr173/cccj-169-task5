@@ -11,18 +11,24 @@ from .db import now_iso
 
 
 class ApiError(Exception):
-    """Domain/HTTP error.  ``status`` is the HTTP status code to return."""
+    """Domain/HTTP error.  ``status`` is the HTTP status code to return.
 
-    def __init__(self, status: int, error: str, detail: str | None = None):
+    ``extra`` 存放随错误返回的结构化明细（如批量复核的逐项冲突清单），
+    会被合并进响应体顶层。"""
+
+    def __init__(self, status: int, error: str, detail: str | None = None,
+                 *, extra: dict | None = None):
         super().__init__(detail or error)
         self.status = status
         self.error = error
         self.detail = detail
+        self.extra = extra or {}
 
     def to_body(self) -> dict:
         body = {"error": self.error}
         if self.detail:
             body["detail"] = self.detail
+        body.update(self.extra)
         return body
 
 
@@ -99,6 +105,10 @@ def new_report_id(conn: sqlite3.Connection) -> str:
 
 def new_seal_id(conn: sqlite3.Connection) -> str:
     return f"SEA-{_day_seq(conn, 'seal')}"
+
+
+def new_review_batch_id(conn: sqlite3.Connection) -> str:
+    return f"RB-{_day_seq(conn, 'review_batch')}"
 
 
 def log_event(conn: sqlite3.Connection, device_id: str | None,

@@ -115,16 +115,21 @@ def main():
         "version_id": versions[0]["version_id"]})
 
     # 演示一次性事件封存包：闭环当前 active 版本的全部复核项 → 封存
+    # （用批量复核一次闭环：整批一个事务，可凭批次号追踪）
     import json as _json
     active_vid = next(v["version_id"] for v in versions
                       if v["status"] == "active")
-    for fnd in guards.list_findings(conn, device_id=dev_a["device_id"],
-                                    status="pending"):
-        if fnd["version_id"] == active_vid:
-            guards.review_finding(conn, fnd["finding_id"], {
-                "action": "accept", "reviewer": "张三",
-                "note": "演示：批量闭环后封存",
-                "review_seq": fnd["review_seq"]})
+    pending = [f for f in guards.list_findings(
+        conn, device_id=dev_a["device_id"], status="pending")
+        if f["version_id"] == active_vid]
+    rbatch = None
+    if pending:
+        rbatch = guards.review_batch(conn, {
+            "client_key": "seed-demo-close-all",
+            "reviewer": "张三",
+            "note": "演示：批量接受后封存",
+            "items": [{"finding_id": f["finding_id"], "action": "accept",
+                       "review_seq": f["review_seq"]} for f in pending]})
     sealed = guards.issue_sealed_package(conn, {
         "device_id": dev_a["device_id"], "version_id": active_vid,
         "issued_by": "张三"})
@@ -145,6 +150,10 @@ def main():
     print(f"  {dev_b['device_id']}  挤出机-B（正常）")
     print(f"  已演示：接受 1 项、退回重算 1 项、"
           f"签名报告 {report['report']['payload']['report_id']}")
+    if rbatch:
+        print(f"  批量复核：{rbatch['batch_id']} 整批接受 "
+              f"{rbatch['item_count']} 项（client_key "
+              f"{rbatch['client_key']}，可按批次号查询恢复）")
     print(f"  已封存：{sealed['seal_id']}（版本 {active_vid}，"
           f"事件 {sealed['event_count']}，复核 {sealed['review_total']}）")
     print("  离线核对（无服务/无数据库）：")

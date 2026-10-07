@@ -118,5 +118,11 @@ canvas {
 .badge.sealed   { color: var(--accent); border-color: var(--accent); }
 .badge.ready    { color: var(--warn); border-color: var(--warn); }
 .badge.downloaded { color: var(--ok); border-color: var(--ok); }
+.badge.applied  { color: var(--ok);   border-color: var(--ok); }
+.panel-box {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 4px; padding: 12px 14px; margin: 12px 0;
+}
+.finding-check, #finding-check-all { cursor: pointer; }
 footer { padding: 12px 22px; border-top: 1px solid var(--line); }
 code { color: var(--accent); }

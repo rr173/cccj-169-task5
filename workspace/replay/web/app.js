@@ -10,6 +10,10 @@ const state = {
   replayIdx: 0,
   lastReport: null,
   pendingSealDownload: null,  // 刚发放、待一次性下载的封存包 {sealId, token}
+  findings: [],        // 当前设备已加载的复核项（含 review_seq）
+  batchSel: new Set(), // 已勾选的待复核项 finding_id
+  batchKey: null,      // 本次批量预览的 client_key（幂等键）
+  batchReq: null,      // 已发出的批量请求体（断网重试 / 恢复用）
 };
 
 /* ------------------------------------------------------------------ */
@@ -26,6 +30,7 @@ async function api(method, path, body) {
     const err = new Error(data.detail || data.error || `HTTP ${resp.status}`);
     err.status = resp.status;
     err.code = data.error;
+    err.data = data;   // 结构化明细（如批量复核的 conflicts）
     throw err;
   }
   return data;
@@ -391,7 +396,7 @@ function renderEventTable() {
 }
 
 /* ------------------------------------------------------------------ */
-/* 风险复核                                                              */
+/* 风险复核（单项 + 批量）                                                */
 /* ------------------------------------------------------------------ */
 const FTYPE_NAMES = {
   continuous_overlimit: "连续超限",
@@ -402,6 +407,12 @@ const STATUS_NAMES = {
   pending: "待复核", accepted: "已接受",
   rejected: "已驳回", returned: "已退回重算",
 };
+const ACTION_NAMES = { accept: "接受", reject: "驳回", return: "退回重算" };
+
+function visibleFindings() {
+  const ftype = $("#finding-ftype-filter").value;
+  return state.findings.filter((f) => !ftype || f.ftype === ftype);
+}
 
 async function loadFindings() {
   if (!state.deviceId) return;
@@ -409,9 +420,26 @@ async function loadFindings() {
   const { findings } = await api(
     "GET", `/api/findings?device_id=${state.deviceId}`
            + (status ? `&status=${status}` : ""));
+  state.findings = findings;
+  // 已不在待复核集合里的项从勾选集中剔除（例如刚被处理过）
+  const pendingIds = new Set(
+    findings.filter((f) => f.status === "pending")
+      .map((f) => f.finding_id));
+  state.batchSel.forEach((id) => {
+    if (!pendingIds.has(id)) state.batchSel.delete(id);
+  });
+  renderFindings();
+  loadReviewBatches();
+}
+
+function renderFindings() {
   const tbody = $("#finding-table tbody");
-  tbody.innerHTML = findings.map((f) => `
+  tbody.innerHTML = visibleFindings().map((f) => `
     <tr>
+      <td>${f.status === "pending" ? `
+        <input type="checkbox" class="finding-check"
+               data-id="${f.finding_id}"
+               ${state.batchSel.has(f.finding_id) ? "checked" : ""}>` : ""}</td>
       <td>${esc(f.finding_id)}</td>
       <td>${FTYPE_NAMES[f.ftype] || f.ftype}</td>
       <td>${esc(f.kind)}</td>
@@ -436,7 +464,33 @@ async function loadFindings() {
       review(btn.dataset.id, btn.dataset.act, parseInt(btn.dataset.seq, 10))));
   tbody.querySelectorAll("button[data-hist]").forEach((btn) =>
     btn.addEventListener("click", () => showHistory(btn.dataset.hist)));
+  tbody.querySelectorAll(".finding-check").forEach((cb) =>
+    cb.addEventListener("change", () => {
+      if (cb.checked) state.batchSel.add(cb.dataset.id);
+      else state.batchSel.delete(cb.dataset.id);
+      updateBatchBar();
+    }));
+  updateBatchBar();
 }
+
+function updateBatchBar() {
+  const btn = $("#batch-open");
+  btn.disabled = state.batchSel.size === 0;
+  btn.textContent = `批量复核预览（${state.batchSel.size}）`;
+  const visiblePending = visibleFindings()
+    .filter((f) => f.status === "pending");
+  $("#finding-check-all").checked = visiblePending.length > 0
+    && visiblePending.every((f) => state.batchSel.has(f.finding_id));
+}
+
+$("#finding-check-all").addEventListener("change", (e) => {
+  visibleFindings().filter((f) => f.status === "pending")
+    .forEach((f) => {
+      if (e.target.checked) state.batchSel.add(f.finding_id);
+      else state.batchSel.delete(f.finding_id);
+    });
+  renderFindings();
+});
 
 async function review(findingId, action, reviewSeq) {
   const note = prompt(
@@ -475,11 +529,222 @@ async function showHistory(findingId) {
     + (history.length
        ? history.map((h) =>
            `· ${fmtTime(h.created_at)} ${h.reviewer} ${h.action}`
+           + (h.batch_id ? `（批次 ${h.batch_id}）` : "")
            + (h.note ? `：${h.note}` : "")).join("\n")
        : "（无）");
 }
 
 $("#finding-filter").addEventListener("change", loadFindings);
+$("#finding-ftype-filter").addEventListener("change", renderFindings);
+
+/* ------------------------------------------------------------------ */
+/* 批量复核：预览 → 整批提交（幂等）→ 冲突明细 / 断网恢复                 */
+/* ------------------------------------------------------------------ */
+function newClientKey() {
+  const uuid = (window.crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `web-${uuid}`;
+}
+
+$("#batch-open").addEventListener("click", () => {
+  const items = [...state.batchSel]
+    .map((id) => state.findings.find((f) => f.finding_id === id))
+    .filter(Boolean);
+  if (!items.length) return;
+  // 每次打开预览生成新的幂等键；同一次预览的重试共用该键
+  state.batchKey = newClientKey();
+  state.batchReq = null;
+  $("#batch-retry").classList.add("hidden");
+  $("#batch-key").textContent = `client_key：${state.batchKey}`;
+  const tbody = $("#batch-preview-table tbody");
+  tbody.innerHTML = items.map((f) => `
+    <tr>
+      <td>${esc(f.finding_id)}</td>
+      <td>${FTYPE_NAMES[f.ftype] || f.ftype}</td>
+      <td>${esc(f.kind)}</td>
+      <td>${fmtTs(f.start_ts)}<br>→ ${fmtTs(f.end_ts)}</td>
+      <td>${f.review_seq}</td>
+      <td><select class="batch-action" data-id="${f.finding_id}">
+        <option value="accept">接受</option>
+        <option value="reject">驳回</option>
+        <option value="return">退回重算</option>
+      </select></td>
+    </tr>`).join("");
+  tbody.querySelectorAll(".batch-action").forEach((sel) =>
+    sel.addEventListener("change", updateBatchSummary));
+  $("#batch-preview").classList.remove("hidden");
+  updateBatchSummary();
+  $("#batch-preview").scrollIntoView({ behavior: "smooth" });
+});
+
+function batchRequestItems() {
+  const items = [];
+  document.querySelectorAll(".batch-action").forEach((sel) => {
+    const f = state.findings.find((x) => x.finding_id === sel.dataset.id);
+    if (!f) return;   // 预览期间列表被刷新：以服务端 409 冲突明细为准
+    items.push({ finding_id: sel.dataset.id, action: sel.value,
+                 review_seq: f.review_seq });
+  });
+  return items;
+}
+
+function updateBatchSummary() {
+  const counts = { accept: 0, reject: 0, return: 0 };
+  document.querySelectorAll(".batch-action")
+    .forEach((sel) => { counts[sel.value] += 1; });
+  $("#batch-summary").textContent =
+    `将接受 ${counts.accept} 项 · 驳回 ${counts.reject} 项 · `
+    + `退回重算 ${counts.return} 项`
+    + (counts.return ? "（退回的项将按设备各触发一次时间线重算）" : "");
+}
+
+$("#batch-all-accept").addEventListener("click", () => {
+  document.querySelectorAll(".batch-action")
+    .forEach((s) => { s.value = "accept"; });
+  updateBatchSummary();
+});
+$("#batch-all-reject").addEventListener("click", () => {
+  document.querySelectorAll(".batch-action")
+    .forEach((s) => { s.value = "reject"; });
+  updateBatchSummary();
+});
+$("#batch-cancel").addEventListener("click", () => {
+  $("#batch-preview").classList.add("hidden");
+});
+
+function showBatchResult(r) {
+  const box = $("#batch-result");
+  box.className = "notice ok";
+  const counts = {};
+  (r.results || []).forEach((it) => {
+    counts[it.status] = (counts[it.status] || 0) + 1;
+  });
+  const parts = Object.entries(counts)
+    .map(([st, n]) => `${STATUS_NAMES[st] || st} ${n} 项`).join(" · ");
+  let msg = `批次 ${r.batch_id} 已应用（${parts}）`
+    + (r.idempotent_replay ? "（重复提交，返回原结果）" : "");
+  if (r.recompute && r.recompute.length) {
+    msg += "\n退回重算产生新版本："
+      + r.recompute.map((v) => `${v.version_id}（${v.device_id}，`
+        + `新复核项 ${v.finding_count} 个）`).join("、");
+  }
+  msg += "\n逐项结果：\n" + (r.results || []).map((it) =>
+    `· ${it.finding_id} → ${STATUS_NAMES[it.status] || it.status}`
+    + `（${ACTION_NAMES[it.action] || it.action}）`).join("\n");
+  box.textContent = msg;
+}
+
+function finishBatch(r) {
+  showBatchResult(r);
+  state.batchSel.clear();
+  state.batchReq = null;
+  $("#batch-retry").classList.add("hidden");
+  $("#batch-preview").classList.add("hidden");
+  $("#batch-note").value = "";
+  loadFindings();
+  loadDevices();
+}
+
+async function submitBatch(body) {
+  try {
+    finishBatch(await api("POST", "/api/review-batches", body));
+  } catch (e) {
+    const box = $("#batch-result");
+    if (e.code === "review_batch_conflict" && e.data && e.data.conflicts) {
+      // 整批未应用：列出每一项冲突明细，刷新到最新状态
+      box.className = "notice bad";
+      box.textContent = `批次未应用（整批不变）：${e.message}\n冲突明细：\n`
+        + e.data.conflicts.map((c) =>
+          `· ${c.finding_id} 当前状态 `
+          + `${STATUS_NAMES[c.current_status] || c.current_status}`
+          + `，当前 review_seq=${c.current_review_seq}`
+          + `（提交时按 ${c.expected_review_seq}）`).join("\n");
+      $("#batch-preview").classList.add("hidden");
+      loadFindings();
+    } else if (!e.status) {
+      // 网络层失败：批次可能已落库 —— 同一 client_key 重试幂等，
+      // 或凭 client_key 在下方查询恢复
+      box.className = "notice bad";
+      box.textContent = `网络中断或请求未到达：${e.message}\n`
+        + `本批次 client_key：${body.client_key}\n`
+        + "可点击「重试提交」（幂等，不会重复应用），或在下方"
+        + "「查询 / 恢复批次」输入该 client_key 取回结果。";
+      $("#batch-retry").classList.remove("hidden");
+    } else {
+      box.className = "notice bad";
+      box.textContent = `批次提交失败：${e.message}`;
+    }
+  }
+}
+
+$("#batch-submit").addEventListener("click", async () => {
+  const items = batchRequestItems();
+  if (!items.length) return;
+  const body = {
+    client_key: state.batchKey,
+    reviewer: $("#reviewer").value.trim() || "匿名",
+    note: $("#batch-note").value.trim() || null,
+    items,
+  };
+  state.batchReq = body;   // 留存原始请求体，断网可原样重试
+  const btn = $("#batch-submit");
+  btn.disabled = true;
+  try {
+    await submitBatch(body);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("#batch-retry").addEventListener("click", async () => {
+  if (!state.batchReq) return;
+  await submitBatch(state.batchReq);   // 同一 client_key：服务端幂等
+});
+
+$("#batch-recover").addEventListener("click", async () => {
+  const key = $("#batch-recover-key").value.trim();
+  if (!key) return;
+  const box = $("#batch-result");
+  try {
+    let r;
+    try {
+      r = await api("GET", `/api/review-batches/${encodeURIComponent(key)}`);
+    } catch (e) {
+      if (e.status !== 404) throw e;
+      r = await api("GET",
+        `/api/review-batches?client_key=${encodeURIComponent(key)}`);
+    }
+    showBatchResult(r);
+    loadFindings();
+  } catch (e) {
+    box.className = "notice bad";
+    box.textContent = `未找到批次：${e.message}`;
+  }
+});
+
+async function loadReviewBatches() {
+  if (!state.deviceId) return;
+  const { batches } = await api(
+    "GET", `/api/review-batches?device_id=${state.deviceId}`);
+  const tbody = $("#batch-table tbody");
+  tbody.innerHTML = batches.map((b) => `
+    <tr>
+      <td>${esc(b.batch_id)}</td>
+      <td>${esc(b.reviewer)}</td>
+      <td>${b.item_count}</td>
+      <td><span class="badge applied">${b.status}</span></td>
+      <td>${fmtTime(b.created_at)}</td>
+      <td><button class="ghost" data-batch="${esc(b.batch_id)}">
+        逐项结果</button></td>
+    </tr>`).join("");
+  tbody.querySelectorAll("button[data-batch]").forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      const r = await api(
+        "GET", `/api/review-batches/${btn.dataset.batch}`);
+      showBatchResult(r);
+    }));
+}
 
 /* ------------------------------------------------------------------ */
 /* 审计报告                                                              */

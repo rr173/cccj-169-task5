@@ -114,7 +114,33 @@ CREATE TABLE IF NOT EXISTS review_history (
     action      TEXT NOT NULL,
     reviewer    TEXT,
     note        TEXT,
+    batch_id    TEXT,                   -- 批量复核批次号（单项复核为 NULL）
     created_at  TEXT NOT NULL
+);
+
+-- 批量复核：整批一个事务（全部项校验通过才应用，任一冲突整体不变）。
+-- client_key 是客户端幂等键：重复提交返回首次结果；断网后可凭
+-- client_key 或批次号查询恢复。逐项结果落 review_batch_items。
+CREATE TABLE IF NOT EXISTS review_batches (
+    batch_id       TEXT PRIMARY KEY,        -- 服务端批次号 RB-…
+    client_key     TEXT NOT NULL UNIQUE,    -- 客户端幂等键
+    request_sha256 TEXT NOT NULL,           -- 请求指纹：同键不同载荷 → 409
+    reviewer       TEXT NOT NULL,
+    note           TEXT,
+    item_count     INTEGER NOT NULL,
+    recompute      TEXT,                    -- JSON：退回重算产生的新版本（若有）
+    status         TEXT NOT NULL DEFAULT 'applied'
+                       CHECK(status IN ('applied')),
+    created_at     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS review_batch_items (
+    batch_id    TEXT NOT NULL REFERENCES review_batches(batch_id),
+    finding_id  TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    review_seq  INTEGER NOT NULL,           -- 提交时校验通过的读取版本号
+    new_status  TEXT NOT NULL,              -- accepted/rejected/returned
+    PRIMARY KEY (batch_id, finding_id)
 );
 
 -- 审计报告：payload 规范化 JSON + 设备密钥 HMAC-SHA256 签名
@@ -158,6 +184,8 @@ CREATE INDEX IF NOT EXISTS idx_corrected_version ON corrected_events(version_id)
 CREATE INDEX IF NOT EXISTS idx_findings_device ON findings(device_id);
 CREATE INDEX IF NOT EXISTS idx_findings_version ON findings(version_id);
 CREATE INDEX IF NOT EXISTS idx_history_finding ON review_history(finding_id);
+CREATE INDEX IF NOT EXISTS idx_batch_items_finding
+    ON review_batch_items(finding_id);
 
 -- 不可变红线：版本一旦被 findings / reports / sealed_packages 引用，
 -- 其校正参数与校正事件一律禁止 UPDATE/DELETE（只能另建新版本）。
@@ -257,6 +285,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # 老触发器（若有）引用旧列定义，统一删后重建
         conn.execute("DROP TRIGGER IF EXISTS trg_chunk_no_update")
         conn.execute("DROP TRIGGER IF EXISTS trg_chunk_no_delete")
+    # 批量复核引入 review_history.batch_id（单项复核的历史为 NULL）
+    cols = {r["name"] for r in
+            conn.execute("PRAGMA table_info(review_history)").fetchall()}
+    if cols and "batch_id" not in cols:
+        conn.execute("ALTER TABLE review_history ADD COLUMN batch_id TEXT")
     # 版本不可变触发器的引用集合随版本演进（新增 sealed_packages 引用），
     # 老库中的旧触发器定义不会被 CREATE TRIGGER IF NOT EXISTS 替换，
     # 先统一删除，再由 init_db 按最新定义重建（触发规则只增不减）。
